@@ -56,7 +56,10 @@ impl ObjectStore {
         }
         buf[offset as usize..end].copy_from_slice(data);
         fs::write(&path, &buf).await?;
-        debug!("wrote {} bytes to object {object_id} @ offset {offset}", data.len());
+        debug!(
+            "wrote {} bytes to object {object_id} @ offset {offset}",
+            data.len()
+        );
         Ok(())
     }
 

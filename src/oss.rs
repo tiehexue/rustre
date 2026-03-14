@@ -80,25 +80,18 @@ async fn register_with_mgs(mgs_addr: &str, listen: &str, ost_index: u32) -> Resu
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    store: Arc<ObjectStore>,
-) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, store: Arc<ObjectStore>) -> Result<()> {
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
-        RpcKind::ObjWrite(req) => {
-            match store.write(&req.object_id, req.offset, &req.data).await {
-                Ok(()) => make_reply(msg.id, RpcKind::Ok),
-                Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
-            }
-        }
+        RpcKind::ObjWrite(req) => match store.write(&req.object_id, req.offset, &req.data).await {
+            Ok(()) => make_reply(msg.id, RpcKind::Ok),
+            Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
+        },
 
-        RpcKind::ObjRead(req) => {
-            match store.read(&req.object_id, req.offset, req.length).await {
-                Ok(data) => make_reply(msg.id, RpcKind::DataReply(data)),
-                Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
-            }
-        }
+        RpcKind::ObjRead(req) => match store.read(&req.object_id, req.offset, req.length).await {
+            Ok(data) => make_reply(msg.id, RpcKind::DataReply(data)),
+            Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
+        },
 
         RpcKind::ObjDelete { object_id } => match store.delete(&object_id).await {
             Ok(()) => make_reply(msg.id, RpcKind::Ok),

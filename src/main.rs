@@ -6,12 +6,12 @@
 //!   OSS  — Object Storage Server: stores actual file data in striped objects
 //!   Client — POSIX-ish CLI that talks to MDS+OSS for file I/O
 
-mod common;
-mod mgs;
-mod mds;
-mod oss;
 mod client;
+mod common;
+mod mds;
+mod mgs;
 mod net;
+mod oss;
 mod storage;
 
 use clap::{Parser, Subcommand};
@@ -19,7 +19,11 @@ use client::ClientCommands;
 
 /// Rustre — a parallel distributed file system
 #[derive(Parser)]
-#[command(name = "rustre", version, about = "A parallel distributed file system inspired by Lustre")]
+#[command(
+    name = "rustre",
+    version,
+    about = "A parallel distributed file system inspired by Lustre"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

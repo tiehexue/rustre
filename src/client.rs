@@ -148,10 +148,7 @@ pub async fn status(mgs_addr: &str) -> Result<()> {
                 let total_gb = ost.total_bytes / (1024 * 1024 * 1024);
                 println!(
                     "║    └─ OST-{}: {} ({} MB / {} GB) ║",
-                    ost.ost_index,
-                    ost.address,
-                    used_mb,
-                    total_gb
+                    ost.ost_index, ost.address, used_mb, total_gb
                 );
             }
             println!("╚══════════════════════════════════════════════╝");
@@ -181,7 +178,10 @@ async fn cmd_put(
 ) -> Result<()> {
     // Read the local file
     let data = tokio::fs::read(source).await.map_err(|e| {
-        RustreError::Io(std::io::Error::new(e.kind(), format!("reading {source}: {e}")))
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("reading {source}: {e}"),
+        ))
     })?;
     let file_size = data.len() as u64;
     info!("PUT: {source} → {dest} ({file_size} bytes)");
@@ -330,7 +330,7 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     );
 
     // Calculate how many chunks total
-    let total_chunks = (file_size + chunk_size - 1) / chunk_size;
+    let total_chunks = file_size.div_ceil(chunk_size);
 
     // Read all chunks in parallel
     let mut read_futures = Vec::new();
@@ -407,7 +407,7 @@ async fn cmd_ls(mgs_addr: &str, path: &str) -> Result<()> {
             if entries.is_empty() {
                 println!("(empty directory)");
             } else {
-                println!("{:<8} {:<6} {:>12} {}", "INO", "TYPE", "SIZE", "NAME");
+                println!("{:<8} {:<6} {:>12} NAME", "INO", "TYPE", "SIZE");
                 println!("{}", "-".repeat(50));
                 for entry in entries {
                     let kind = if entry.is_dir { "dir" } else { "file" };
@@ -511,7 +511,10 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
         RpcKind::MetaReply(meta) => {
             println!("  Path:    {}", meta.path);
             println!("  Inode:   {}", meta.ino);
-            println!("  Type:    {}", if meta.is_dir { "directory" } else { "file" });
+            println!(
+                "  Type:    {}",
+                if meta.is_dir { "directory" } else { "file" }
+            );
             println!("  Size:    {} bytes", meta.size);
             println!("  Created: {}", meta.ctime);
             println!("  Modified:{}", meta.mtime);

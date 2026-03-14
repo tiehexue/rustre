@@ -50,10 +50,7 @@ pub async fn run(listen: &str, data_dir: &str) -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    state: Arc<RwLock<MgsState>>,
-) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, state: Arc<RwLock<MgsState>>) -> Result<()> {
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
         RpcKind::RegisterMds(mds_info) => {

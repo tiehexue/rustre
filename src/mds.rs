@@ -21,7 +21,7 @@ struct MdsState {
     store: MetaStore,
     next_ino: AtomicU64,
     cluster_config: ClusterConfig,
-#[allow(dead_code)]
+    #[allow(dead_code)]
     mgs_addr: String,
 }
 
@@ -128,10 +128,7 @@ async fn register_with_mgs(mgs_addr: &str, listen: &str) -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    state: Arc<RwLock<MdsState>>,
-) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, state: Arc<RwLock<MdsState>>) -> Result<()> {
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
         RpcKind::Lookup(path) => handle_lookup(msg.id, &path, &state).await,
@@ -191,11 +188,7 @@ fn basename(p: &str) -> String {
     p.rsplit('/').next().unwrap_or("").to_string()
 }
 
-async fn handle_lookup(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+async fn handle_lookup(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
     let path = normalize_path(path);
     let st = state.read().await;
     let ino: u64 = st
@@ -298,9 +291,7 @@ async fn handle_create(
     // Persist
     st.store.save(&format!("inode_{ino}"), &meta).await?;
     st.store.save(&format!("path_{path}"), &ino).await?;
-    st.store
-        .save("next_ino", &(ino + 1))
-        .await?;
+    st.store.save("next_ino", &(ino + 1)).await?;
 
     // Add to parent's children
     let mut children: Vec<u64> = st
@@ -313,15 +304,14 @@ async fn handle_create(
         .save(&format!("children_{parent_ino}"), &children)
         .await?;
 
-    info!("MDS: created file {path} ino={ino} stripes={}", meta.layout.as_ref().unwrap().stripe_count);
+    info!(
+        "MDS: created file {path} ino={ino} stripes={}",
+        meta.layout.as_ref().unwrap().stripe_count
+    );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
 
-async fn handle_mkdir(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
     let path = normalize_path(path);
     let parent = parent_path(&path);
     let name = basename(&path);
@@ -359,9 +349,7 @@ async fn handle_mkdir(
     st.store
         .save::<Vec<u64>>(&format!("children_{ino}"), &vec![])
         .await?;
-    st.store
-        .save("next_ino", &(ino + 1))
-        .await?;
+    st.store.save("next_ino", &(ino + 1)).await?;
 
     // Add to parent's children
     let mut children: Vec<u64> = st
@@ -378,11 +366,7 @@ async fn handle_mkdir(
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
-async fn handle_readdir(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+async fn handle_readdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
     let path = normalize_path(path);
     let st = state.read().await;
 
@@ -420,11 +404,7 @@ async fn handle_readdir(
     Ok(make_reply(req_id, RpcKind::MetaListReply(entries)))
 }
 
-async fn handle_unlink(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+async fn handle_unlink(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
     let path = normalize_path(path);
     if path == "/" {
         return Err(RustreError::InvalidArgument(
