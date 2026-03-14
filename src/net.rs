@@ -3,7 +3,7 @@
 //! Analogous to Lustre's PTLRPC + LNet, but simplified for userspace TCP.
 //! Wire format: [4-byte big-endian length][bincode payload]
 
-use crate::common::{RpcKind, RpcMessage, RustreError, Result};
+use crate::common::{Result, RpcKind, RpcMessage, RustreError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -13,8 +13,7 @@ static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Send an RPC message over a TCP stream.
 pub async fn send_msg(stream: &mut TcpStream, msg: &RpcMessage) -> Result<()> {
-    let payload =
-        bincode::serialize(msg).map_err(|e| RustreError::Serialization(e.to_string()))?;
+    let payload = bincode::serialize(msg).map_err(|e| RustreError::Serialization(e.to_string()))?;
     let len = payload.len() as u32;
     stream
         .write_all(&len.to_be_bytes())
@@ -28,7 +27,12 @@ pub async fn send_msg(stream: &mut TcpStream, msg: &RpcMessage) -> Result<()> {
         .flush()
         .await
         .map_err(|e| RustreError::Net(e.to_string()))?;
-    trace!("sent msg id={} kind={:?} ({} bytes)", msg.id, std::mem::discriminant(&msg.kind), len);
+    trace!(
+        "sent msg id={} kind={:?} ({} bytes)",
+        msg.id,
+        std::mem::discriminant(&msg.kind),
+        len
+    );
     Ok(())
 }
 

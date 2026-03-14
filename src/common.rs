@@ -146,12 +146,12 @@ pub enum RpcKind {
     UpdateOstUsage { ost_index: u32, used_bytes: u64 },
 
     // -- MDS RPCs --
-    Lookup(String),           // path → FileMeta
-    Create(CreateReq),        // create file, returns FileMeta with layout
-    Mkdir(String),            // create directory
-    Readdir(String),          // list directory → Vec<FileMeta>
-    Unlink(String),           // remove file
-    Stat(String),             // stat → FileMeta
+    Lookup(String),    // path → FileMeta
+    Create(CreateReq), // create file, returns FileMeta with layout
+    Mkdir(String),     // create directory
+    Readdir(String),   // list directory → Vec<FileMeta>
+    Unlink(String),    // remove file
+    Stat(String),      // stat → FileMeta
     SetSize { path: String, size: u64 },
 
     // -- OSS RPCs --
