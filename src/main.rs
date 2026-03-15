@@ -1,9 +1,9 @@
 //! Rustre — A parallel, distributed file system inspired by Lustre.
 //!
 //! Architecture overview:
-//!   MGS  — Management Server: stores cluster configuration, distributes it to peers
-//!   MDS  — Metadata Server: handles namespace ops (open/stat/mkdir/readdir/unlink)
-//!   OSS  — Object Storage Server: stores actual file data in striped objects
+//!   MGS  — Management Server: stores cluster config in FoundationDB (stateless, HA)
+//!   MDS  — Metadata Server: handles namespace ops in FoundationDB (stateless, HA)
+//!   OSS  — Object Storage Server: stores file data in RocksDB
 //!   Client — POSIX-ish CLI that talks to MDS+OSS for file I/O
 
 mod client;
@@ -31,16 +31,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the Management Server (MGS)
+    /// Start the Management Server (MGS) — backed by FoundationDB for stateless HA
     Mgs {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9400")]
         listen: String,
-        /// Data directory for MGS state
-        #[arg(short, long, default_value = "/tmp/rustre/mgs")]
-        data_dir: String,
+        /// Cluster name (used as FoundationDB key prefix)
+        #[arg(short, long, default_value = "rustre")]
+        cluster_name: String,
     },
-    /// Start a Metadata Server (MDS)
+    /// Start a Metadata Server (MDS) — backed by FoundationDB for stateless HA
     Mds {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9401")]
@@ -48,11 +48,11 @@ enum Commands {
         /// MGS address to register with
         #[arg(short, long, default_value = "127.0.0.1:9400")]
         mgs: String,
-        /// Data directory for metadata
-        #[arg(short, long, default_value = "/tmp/rustre/mds")]
-        data_dir: String,
+        /// Cluster name (used as FoundationDB key prefix, must match MGS)
+        #[arg(short, long, default_value = "rustre")]
+        cluster_name: String,
     },
-    /// Start an Object Storage Server (OSS)
+    /// Start an Object Storage Server (OSS) — backed by RocksDB
     Oss {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9402")]
@@ -60,7 +60,7 @@ enum Commands {
         /// MGS address to register with
         #[arg(short, long, default_value = "127.0.0.1:9400")]
         mgs: String,
-        /// Data directory for object storage
+        /// Data directory for RocksDB storage
         #[arg(short, long, default_value = "/tmp/rustre/oss")]
         data_dir: String,
         /// OST index (unique per OSS instance)
@@ -90,15 +90,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mgs { listen, data_dir } => {
-            mgs::run(&listen, &data_dir).await?;
+        Commands::Mgs {
+            listen,
+            cluster_name,
+        } => {
+            // Initialize FoundationDB network (must happen once per process lifetime)
+            // SAFETY: We call drop(network) at process exit via the tokio runtime shutdown.
+            let _network = unsafe { foundationdb::boot() };
+            mgs::run(&listen, &cluster_name).await?;
         }
         Commands::Mds {
             listen,
             mgs,
-            data_dir,
+            cluster_name,
         } => {
-            mds::run(&listen, &mgs, &data_dir).await?;
+            // MDS also uses FoundationDB — boot the network
+            let _network = unsafe { foundationdb::boot() };
+            mds::run(&listen, &mgs, &cluster_name).await?;
         }
         Commands::Oss {
             listen,

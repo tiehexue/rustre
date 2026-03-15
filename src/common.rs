@@ -31,6 +31,8 @@ pub enum RustreError {
     InvalidArgument(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("FoundationDB error: {0}")]
+    Fdb(String),
 }
 
 pub type Result<T> = std::result::Result<T, RustreError>;
@@ -39,30 +41,51 @@ pub type Result<T> = std::result::Result<T, RustreError>;
 // File / metadata types
 // ---------------------------------------------------------------------------
 
-/// A single stripe component — maps to one object on one OST.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StripeObject {
-    /// Object ID on the OST
-    pub object_id: String,
-    /// Index of the OST this object lives on
-    pub ost_index: u32,
-    /// Byte offset within the file where this stripe begins
-    pub offset: u64,
-    /// Length of data in this stripe object
-    pub length: u64,
-}
+/// Default stripe size: 1 MiB
+pub const DEFAULT_STRIPE_SIZE: u64 = 1_048_576;
 
 /// Describes how a file's data is laid out across OSTs (RAID-0 striping).
+///
+/// Object IDs and OST assignments are deterministic:
+///   object_id(ino, seq) = format!("{:016x}:{:08x}", ino, seq)
+///   ost_for_chunk(seq)  = (stripe_offset + seq) % total_ost_count
+///
+/// No need to store a per-chunk object list in metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StripeLayout {
     /// Number of OSTs the file is striped across
     pub stripe_count: u32,
     /// Size of each stripe chunk in bytes (default: 1 MiB)
     pub stripe_size: u64,
-    /// Starting OST index
+    /// Starting OST index (typically ino % ost_count)
     pub stripe_offset: u32,
-    /// The ordered list of stripe objects
-    pub objects: Vec<StripeObject>,
+}
+
+impl StripeLayout {
+    /// Compute the deterministic object ID for a given inode and stripe sequence.
+    pub fn object_id(ino: u64, stripe_seq: u32) -> String {
+        format!("{:016x}:{:08x}", ino, stripe_seq)
+    }
+
+    /// Compute which OST a given stripe sequence lands on.
+    #[allow(dead_code)]
+    pub fn ost_for_chunk(&self, stripe_seq: u32) -> u32 {
+        (self.stripe_offset + stripe_seq) % self.stripe_count
+    }
+
+    /// Total number of stripe chunks for a file of the given size.
+    pub fn total_chunks(&self, file_size: u64) -> u32 {
+        if file_size == 0 {
+            return 0;
+        }
+        file_size.div_ceil(self.stripe_size) as u32
+    }
+
+    /// Byte offset within an object for a given global stripe sequence.
+    /// Each OST accumulates chunks: obj_offset = (seq / stripe_count) * stripe_size.
+    pub fn obj_offset(&self, stripe_seq: u32) -> u64 {
+        (stripe_seq as u64 / self.stripe_count as u64) * self.stripe_size
+    }
 }
 
 /// Inode-level metadata for a file or directory.
@@ -143,7 +166,10 @@ pub enum RpcKind {
     RegisterOst(OstInfo),
     GetConfig,
     GetConfigReply(ClusterConfig),
-    UpdateOstUsage { ost_index: u32, used_bytes: u64 },
+    UpdateOstUsage {
+        ost_index: u32,
+        used_bytes: u64,
+    },
 
     // -- MDS RPCs --
     Lookup(String),    // path → FileMeta
@@ -152,12 +178,21 @@ pub enum RpcKind {
     Readdir(String),   // list directory → Vec<FileMeta>
     Unlink(String),    // remove file
     Stat(String),      // stat → FileMeta
-    SetSize { path: String, size: u64 },
+    SetSize {
+        path: String,
+        size: u64,
+    },
 
     // -- OSS RPCs --
     ObjWrite(ObjWriteReq),
     ObjRead(ObjReadReq),
-    ObjDelete { object_id: String },
+    ObjDelete {
+        object_id: String,
+    },
+    /// Delete all objects for an inode (bulk cleanup)
+    ObjDeleteInode {
+        ino: u64,
+    },
 
     // -- Generic replies --
     Ok,
