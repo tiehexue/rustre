@@ -6,15 +6,9 @@
 //! 2. Talks to MDS for metadata ops (create, lookup, readdir, unlink, stat)
 //! 3. Talks directly to OSTs for data I/O — RAID-0 striped writes and parallel reads
 //!
-//! Data flow for a PUT:
-//!   Client reads local file → splits into stripe-sized chunks →
-//!   sends each chunk to the appropriate OST in parallel →
-//!   updates file size on MDS
-//!
-//! Data flow for a GET:
-//!   Client fetches metadata (with stripe layout) from MDS →
-//!   reads stripe objects from OSTs in parallel →
-//!   reassembles into local file
+//! Object IDs and OST assignments are now computed deterministically from
+//! (ino, stripe_seq) using StripeLayout helper methods — no need to store
+//! per-object lists in metadata.
 
 use crate::common::*;
 use crate::net::rpc_call;
@@ -166,7 +160,7 @@ pub async fn status(mgs_addr: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// PUT — striped parallel write
+// PUT — striped parallel write (using deterministic object IDs)
 // ---------------------------------------------------------------------------
 
 async fn cmd_put(
@@ -213,28 +207,27 @@ async fn cmd_put(
         .ok_or_else(|| RustreError::Internal("no stripe layout returned".into()))?;
 
     println!(
-        "Created {dest} (ino={}, stripes={}, stripe_size={})",
-        meta.ino, layout.stripe_count, layout.stripe_size
+        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={})",
+        meta.ino, layout.stripe_count, layout.stripe_size, layout.stripe_offset
     );
 
-    // Split data into stripe-sized chunks and send to OSTs in parallel
+    // Split data into stripe-sized chunks and send to OSTs in parallel.
+    // Object IDs are deterministic: StripeLayout::object_id(ino, stripe_seq).
+    // OST assignment: layout.ost_for_chunk(stripe_seq).
     let chunk_size = layout.stripe_size as usize;
-    let stripe_count = layout.stripe_count as usize;
+    let ost_count = config.ost_list.len() as u32;
     let mut write_futures = Vec::new();
 
     let mut offset = 0usize;
-    let mut chunk_index = 0usize;
+    let mut chunk_index = 0u32;
     while offset < data.len() {
         let end = std::cmp::min(offset + chunk_size, data.len());
         let chunk_data = data[offset..end].to_vec();
-        let stripe_idx = chunk_index % stripe_count;
-        let obj = &layout.objects[stripe_idx];
-        let object_id = obj.object_id.clone();
-        let ost_index = obj.ost_index;
 
-        // Each stripe object accumulates data at increasing offsets
-        // Offset within the object = (chunk_index / stripe_count) * chunk_size
-        let obj_offset = (chunk_index / stripe_count) as u64 * layout.stripe_size;
+        // Deterministic object ID and OST assignment
+        let object_id = StripeLayout::object_id(meta.ino, chunk_index);
+        let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
+        let obj_offset = layout.obj_offset(chunk_index);
 
         let addr = ost_addr(&config, ost_index)?;
 
@@ -296,7 +289,7 @@ async fn cmd_put(
 }
 
 // ---------------------------------------------------------------------------
-// GET — parallel stripe read
+// GET — parallel stripe read (using deterministic object IDs)
 // ---------------------------------------------------------------------------
 
 async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
@@ -322,33 +315,32 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
 
     let file_size = meta.size as usize;
     let chunk_size = layout.stripe_size as usize;
-    let stripe_count = layout.stripe_count as usize;
+    let ost_count = config.ost_list.len() as u32;
 
     println!(
         "GET: {source} → {dest} ({} bytes, {} stripes)",
-        file_size, stripe_count
+        file_size, layout.stripe_count
     );
 
     // Calculate how many chunks total
-    let total_chunks = file_size.div_ceil(chunk_size);
+    let total_chunks = layout.total_chunks(meta.size);
 
-    // Read all chunks in parallel
+    // Read all chunks in parallel using deterministic object IDs
     let mut read_futures = Vec::new();
     for chunk_index in 0..total_chunks {
-        let stripe_idx = chunk_index % stripe_count;
-        let obj = &layout.objects[stripe_idx];
-        let object_id = obj.object_id.clone();
-        let ost_index = obj.ost_index;
-        let obj_offset = (chunk_index / stripe_count) as u64 * layout.stripe_size;
+        let object_id = StripeLayout::object_id(meta.ino, chunk_index);
+        let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
+        let obj_offset = layout.obj_offset(chunk_index);
 
         // How much to read from this chunk
-        let remaining = file_size - chunk_index * chunk_size;
+        let file_offset = chunk_index as usize * chunk_size;
+        let remaining = file_size - file_offset;
         let read_len = std::cmp::min(chunk_size, remaining) as u64;
 
         let addr = ost_addr(&config, ost_index)?;
 
         read_futures.push((
-            chunk_index,
+            chunk_index as usize,
             tokio::spawn(async move {
                 let result = rpc_call(
                     &addr,
@@ -455,14 +447,14 @@ async fn cmd_mkdir(mgs_addr: &str, path: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// RM — remove file
+// RM — remove file (uses bulk ObjDeleteInode for efficient cleanup)
 // ---------------------------------------------------------------------------
 
 async fn cmd_rm(mgs_addr: &str, path: &str) -> Result<()> {
     let config = get_config(mgs_addr).await?;
     let mds = mds_addr(&config)?;
 
-    // First get the file metadata to know which objects to delete
+    // First get the file metadata to know which OSTs to notify
     let stat_reply = rpc_call(&mds, RpcKind::Stat(path.to_string())).await?;
     let meta = match stat_reply.kind {
         RpcKind::MetaReply(m) => m,
@@ -470,14 +462,16 @@ async fn cmd_rm(mgs_addr: &str, path: &str) -> Result<()> {
         _ => return Err(RustreError::Net("unexpected reply".into())),
     };
 
-    // Delete stripe objects from OSTs
-    if let Some(layout) = &meta.layout {
+    // Delete all stripe objects from OSTs using bulk inode deletion.
+    // We send ObjDeleteInode to all OSTs that could hold stripes for this file.
+    if meta.layout.is_some() {
+        // Send bulk delete to all OSTs in the cluster (they'll handle prefix scan)
         let mut delete_futures = Vec::new();
-        for obj in &layout.objects {
-            let addr = ost_addr(&config, obj.ost_index)?;
-            let oid = obj.object_id.clone();
+        for ost_info in &config.ost_list {
+            let addr = ost_info.address.clone();
+            let ino = meta.ino;
             delete_futures.push(tokio::spawn(async move {
-                let _ = rpc_call(&addr, RpcKind::ObjDelete { object_id: oid }).await;
+                let _ = rpc_call(&addr, RpcKind::ObjDeleteInode { ino }).await;
             }));
         }
         join_all(delete_futures).await;
@@ -519,16 +513,22 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
             println!("  Created: {}", meta.ctime);
             println!("  Modified:{}", meta.mtime);
             if let Some(layout) = &meta.layout {
+                let ost_count = config.ost_list.len() as u32;
+                let total_chunks = layout.total_chunks(meta.size);
                 println!("  Stripe Layout:");
                 println!("    stripe_count:  {}", layout.stripe_count);
                 println!("    stripe_size:   {} bytes", layout.stripe_size);
                 println!("    stripe_offset: {}", layout.stripe_offset);
-                println!("    Objects:");
-                for (i, obj) in layout.objects.iter().enumerate() {
-                    println!(
-                        "      [{i}] object_id={} ost_index={} offset={} length={}",
-                        obj.object_id, obj.ost_index, obj.offset, obj.length
-                    );
+                println!("    total_chunks:  {}", total_chunks);
+                println!("    Object mapping (deterministic):");
+                for seq in 0..std::cmp::min(total_chunks, 16) {
+                    let oid = StripeLayout::object_id(meta.ino, seq);
+                    let ost = (layout.stripe_offset + seq) % ost_count;
+                    let obj_off = layout.obj_offset(seq);
+                    println!("      [seq={seq}] object_id={oid} → OST-{ost} @ offset {obj_off}",);
+                }
+                if total_chunks > 16 {
+                    println!("      ... ({} more chunks)", total_chunks - 16);
                 }
             }
             Ok(())

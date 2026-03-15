@@ -6,59 +6,43 @@
 //! - Stripe layout computation for new files (round-robin across OSTs)
 //! - Registers itself with the MGS on startup
 //!
-//! On disk, metadata is persisted via MetaStore (JSON files).
+//! All metadata is persisted in FoundationDB via `FdbMdsStore`.
+//! This makes MDS completely stateless — multiple MDS instances can run
+//! concurrently for high availability. Any MDS can serve any request since
+//! all state lives in FDB with transactional consistency.
+//!
+//! Stripe layouts are simplified — no per-object list, just parameters.
+//! Object IDs are deterministic: derived from (ino, stripe_seq).
 
 use crate::common::*;
 use crate::net::{make_reply, recv_msg, rpc_call, send_msg};
-use crate::storage::MetaStore;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::storage::FdbMdsStore;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 struct MdsState {
-    store: MetaStore,
-    next_ino: AtomicU64,
+    store: FdbMdsStore,
     cluster_config: ClusterConfig,
     #[allow(dead_code)]
     mgs_addr: String,
 }
 
+#[allow(dead_code)]
 const ROOT_INO: u64 = 1;
 
-pub async fn run(listen: &str, mgs_addr: &str, data_dir: &str) -> Result<()> {
-    let store = MetaStore::new(data_dir).await?;
+pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()> {
+    let store = FdbMdsStore::new(cluster_name)?;
 
-    // Ensure root directory exists
-    if !store.exists("inode_1").await {
-        let root = FileMeta {
-            ino: ROOT_INO,
-            name: "/".into(),
-            path: "/".into(),
-            is_dir: true,
-            size: 0,
-            ctime: FileMeta::now_secs(),
-            mtime: FileMeta::now_secs(),
-            layout: None,
-            parent_ino: 0,
-        };
-        store.save("inode_1", &root).await?;
-        // Root directory children list
-        store.save::<Vec<u64>>("children_1", &vec![]).await?;
-        store.save("next_ino", &2u64).await?;
-        // Path → inode mapping
-        store.save("path_/", &ROOT_INO).await?;
-    }
-
-    let next_ino_val: u64 = store.load("next_ino").await.unwrap_or(2);
+    // Ensure root directory exists in FDB (idempotent)
+    store.ensure_root().await?;
 
     // Fetch cluster config from MGS
     let config = fetch_config(mgs_addr).await?;
 
     let state = Arc::new(RwLock::new(MdsState {
         store,
-        next_ino: AtomicU64::new(next_ino_val),
         cluster_config: config,
         mgs_addr: mgs_addr.to_string(),
     }));
@@ -82,7 +66,7 @@ pub async fn run(listen: &str, mgs_addr: &str, data_dir: &str) -> Result<()> {
     }
 
     let listener = TcpListener::bind(listen).await?;
-    info!("MDS listening on {listen}");
+    info!("MDS listening on {listen} (stateless, backed by FoundationDB cluster={cluster_name})");
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -188,19 +172,26 @@ fn basename(p: &str) -> String {
     p.rsplit('/').next().unwrap_or("").to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Handlers — all metadata ops go through FdbMdsStore
+// ---------------------------------------------------------------------------
+
 async fn handle_lookup(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
     let path = normalize_path(path);
     let st = state.read().await;
-    let ino: u64 = st
+
+    let ino = st
         .store
-        .load(&format!("path_{path}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
-    let meta: FileMeta = st
+        .resolve_path(&path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    let meta = st
         .store
-        .load(&format!("inode_{ino}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
 
@@ -213,25 +204,27 @@ async fn handle_create(
     let parent = parent_path(&path);
     let name = basename(&path);
 
-    let st = state.write().await;
+    let st = state.read().await;
 
     // Check parent exists and is a directory
-    let parent_ino: u64 = st
+    let parent_ino = st
         .store
-        .load(&format!("path_{parent}"))
-        .await
-        .map_err(|_| RustreError::NotFound(format!("parent directory: {parent}")))?;
-    let parent_meta: FileMeta = st
+        .resolve_path(&parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
+
+    let parent_meta = st
         .store
-        .load(&format!("inode_{parent_ino}"))
-        .await
-        .map_err(|_| RustreError::NotFound(parent.clone()))?;
+        .get_inode(parent_ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(parent.clone()))?;
+
     if !parent_meta.is_dir {
         return Err(RustreError::NotADirectory(parent));
     }
 
     // Check if already exists
-    if st.store.exists(&format!("path_{path}")).await {
+    if (st.store.resolve_path(&path).await?).is_some() {
         return Err(RustreError::AlreadyExists(path));
     }
 
@@ -246,33 +239,21 @@ async fn handle_create(
         req.stripe_count
     };
     let stripe_size = if req.stripe_size == 0 {
-        1_048_576 // 1 MiB default
+        DEFAULT_STRIPE_SIZE
     } else {
         req.stripe_size
     };
 
-    // Round-robin OST assignment starting from a pseudo-random offset
-    let ino = st.next_ino.fetch_add(1, Ordering::Relaxed);
-    let stripe_offset = (ino as u32) % ost_count;
+    // Allocate inode atomically from FDB
+    let ino = st.store.alloc_ino().await?;
 
-    // Create stripe objects (one per OST in the stripe)
-    let mut objects = Vec::with_capacity(stripe_count as usize);
-    for i in 0..stripe_count {
-        let ost_idx = (stripe_offset + i) % ost_count;
-        let object_id = format!("{:016x}_{ost_idx}", ino);
-        objects.push(StripeObject {
-            object_id,
-            ost_index: ost_idx,
-            offset: 0, // Will be filled by client during write
-            length: 0,
-        });
-    }
+    // Stripe offset: spread files across OSTs for even distribution
+    let stripe_offset = (ino as u32) % ost_count;
 
     let layout = StripeLayout {
         stripe_count,
         stripe_size,
         stripe_offset,
-        objects,
     };
 
     let now = FileMeta::now_secs();
@@ -284,29 +265,16 @@ async fn handle_create(
         size: 0,
         ctime: now,
         mtime: now,
-        layout: Some(layout),
+        layout: Some(layout.clone()),
         parent_ino,
     };
 
-    // Persist
-    st.store.save(&format!("inode_{ino}"), &meta).await?;
-    st.store.save(&format!("path_{path}"), &ino).await?;
-    st.store.save("next_ino", &(ino + 1)).await?;
-
-    // Add to parent's children
-    let mut children: Vec<u64> = st
-        .store
-        .load(&format!("children_{parent_ino}"))
-        .await
-        .unwrap_or_default();
-    children.push(ino);
-    st.store
-        .save(&format!("children_{parent_ino}"), &children)
-        .await?;
+    // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
+    st.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!(
-        "MDS: created file {path} ino={ino} stripes={}",
-        meta.layout.as_ref().unwrap().stripe_count
+        "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={}",
+        layout.stripe_count, layout.stripe_size, layout.stripe_offset
     );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
@@ -316,21 +284,23 @@ async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Resu
     let parent = parent_path(&path);
     let name = basename(&path);
 
-    let st = state.write().await;
+    let st = state.read().await;
 
-    // Check parent
-    let parent_ino: u64 = st
+    // Check parent exists
+    let parent_ino = st
         .store
-        .load(&format!("path_{parent}"))
-        .await
-        .map_err(|_| RustreError::NotFound(format!("parent directory: {parent}")))?;
+        .resolve_path(&parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
 
     // Check not exists
-    if st.store.exists(&format!("path_{path}")).await {
+    if (st.store.resolve_path(&path).await?).is_some() {
         return Err(RustreError::AlreadyExists(path));
     }
 
-    let ino = st.next_ino.fetch_add(1, Ordering::Relaxed);
+    // Allocate inode atomically from FDB
+    let ino = st.store.alloc_ino().await?;
+
     let now = FileMeta::now_secs();
     let meta = FileMeta {
         ino,
@@ -344,23 +314,8 @@ async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Resu
         parent_ino,
     };
 
-    st.store.save(&format!("inode_{ino}"), &meta).await?;
-    st.store.save(&format!("path_{path}"), &ino).await?;
-    st.store
-        .save::<Vec<u64>>(&format!("children_{ino}"), &vec![])
-        .await?;
-    st.store.save("next_ino", &(ino + 1)).await?;
-
-    // Add to parent's children
-    let mut children: Vec<u64> = st
-        .store
-        .load(&format!("children_{parent_ino}"))
-        .await
-        .unwrap_or_default();
-    children.push(ino);
-    st.store
-        .save(&format!("children_{parent_ino}"), &children)
-        .await?;
+    // Persist atomically: inode + path + child entry + next_ino
+    st.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!("MDS: created directory {path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
@@ -370,33 +325,28 @@ async fn handle_readdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Re
     let path = normalize_path(path);
     let st = state.read().await;
 
-    let ino: u64 = st
+    let ino = st
         .store
-        .load(&format!("path_{path}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
-    let meta: FileMeta = st
+        .resolve_path(&path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    let meta = st
         .store
-        .load(&format!("inode_{ino}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
     if !meta.is_dir {
         return Err(RustreError::NotADirectory(path));
     }
 
-    let children: Vec<u64> = st
-        .store
-        .load(&format!("children_{ino}"))
-        .await
-        .unwrap_or_default();
+    // List children via FDB range scan
+    let child_inos = st.store.list_children(ino).await?;
 
     let mut entries = Vec::new();
-    for child_ino in children {
-        if let Ok(child_meta) = st
-            .store
-            .load::<FileMeta>(&format!("inode_{child_ino}"))
-            .await
-        {
+    for child_ino in child_inos {
+        if let Some(child_meta) = st.store.get_inode(child_ino).await? {
             entries.push(child_meta);
         }
     }
@@ -412,46 +362,31 @@ async fn handle_unlink(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Res
         ));
     }
 
-    let st = state.write().await;
+    let st = state.read().await;
 
-    let ino: u64 = st
+    let ino = st
         .store
-        .load(&format!("path_{path}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
-    let meta: FileMeta = st
+        .resolve_path(&path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    let meta = st
         .store
-        .load(&format!("inode_{ino}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
     if meta.is_dir {
-        let children: Vec<u64> = st
-            .store
-            .load(&format!("children_{ino}"))
-            .await
-            .unwrap_or_default();
-        if !children.is_empty() {
+        // Check directory is empty
+        if st.store.has_children(ino).await? {
             return Err(RustreError::DirNotEmpty(path));
         }
-        st.store.delete(&format!("children_{ino}")).await?;
     }
 
-    // Remove from parent's children
-    let parent_ino = meta.parent_ino;
-    let mut children: Vec<u64> = st
-        .store
-        .load(&format!("children_{parent_ino}"))
-        .await
-        .unwrap_or_default();
-    children.retain(|&c| c != ino);
+    // Atomically remove: inode + path + parent's child entry (+ children range for dirs)
     st.store
-        .save(&format!("children_{parent_ino}"), &children)
+        .txn_unlink(ino, &path, meta.parent_ino, meta.is_dir)
         .await?;
-
-    // Remove inode and path mapping
-    st.store.delete(&format!("inode_{ino}")).await?;
-    st.store.delete(&format!("path_{path}")).await?;
 
     info!("MDS: unlinked {path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
@@ -464,22 +399,23 @@ async fn handle_set_size(
     state: &RwLock<MdsState>,
 ) -> Result<RpcMessage> {
     let path = normalize_path(path);
-    let st = state.write().await;
+    let st = state.read().await;
 
-    let ino: u64 = st
+    let ino = st
         .store
-        .load(&format!("path_{path}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
-    let mut meta: FileMeta = st
+        .resolve_path(&path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    let mut meta = st
         .store
-        .load(&format!("inode_{ino}"))
-        .await
-        .map_err(|_| RustreError::NotFound(path.clone()))?;
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
     meta.size = size;
     meta.mtime = FileMeta::now_secs();
-    st.store.save(&format!("inode_{ino}"), &meta).await?;
+    st.store.set_inode(ino, &meta).await?;
 
     Ok(make_reply(req_id, RpcKind::Ok))
 }

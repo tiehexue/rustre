@@ -1,21 +1,21 @@
 //! Object Storage Server (OSS) / Object Storage Target (OST)
 //!
-//! The OSS stores actual file data as objects. Each file is striped across
-//! multiple OSTs (RAID-0 style). The OSS:
+//! The OSS stores actual file data as objects in RocksDB. Each file is striped
+//! across multiple OSTs (RAID-0 style). The OSS:
 //! - Registers its OST with the MGS on startup
-//! - Handles ObjWrite / ObjRead / ObjDelete RPCs from clients
+//! - Handles ObjWrite / ObjRead / ObjDelete / ObjDeleteInode RPCs from clients
 //! - Periodically reports disk usage back to the MGS
-//! - Persists objects on local disk via ObjectStore
+//! - Persists objects in RocksDB via RocksObjectStore
 
 use crate::common::*;
 use crate::net::{make_reply, recv_msg, rpc_call, send_msg};
-use crate::storage::ObjectStore;
+use crate::storage::RocksObjectStore;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 pub async fn run(listen: &str, mgs_addr: &str, data_dir: &str, ost_index: u32) -> Result<()> {
-    let store = ObjectStore::new(data_dir).await?;
+    let store = RocksObjectStore::new(data_dir)?;
     let store = Arc::new(store);
 
     // Register with MGS
@@ -44,7 +44,7 @@ pub async fn run(listen: &str, mgs_addr: &str, data_dir: &str, ost_index: u32) -
     }
 
     let listener = TcpListener::bind(listen).await?;
-    info!("OSS (OST-{ost_index}) listening on {listen}");
+    info!("OSS (OST-{ost_index}) listening on {listen} (RocksDB-backed)");
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -80,7 +80,7 @@ async fn register_with_mgs(mgs_addr: &str, listen: &str, ost_index: u32) -> Resu
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, store: Arc<ObjectStore>) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, store: Arc<RocksObjectStore>) -> Result<()> {
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
         RpcKind::ObjWrite(req) => match store.write(&req.object_id, req.offset, &req.data).await {
@@ -94,6 +94,11 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<ObjectStore>) -> Re
         },
 
         RpcKind::ObjDelete { object_id } => match store.delete(&object_id).await {
+            Ok(()) => make_reply(msg.id, RpcKind::Ok),
+            Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
+        },
+
+        RpcKind::ObjDeleteInode { ino } => match store.delete_inode(ino).await {
             Ok(()) => make_reply(msg.id, RpcKind::Ok),
             Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
         },
