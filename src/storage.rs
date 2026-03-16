@@ -44,57 +44,32 @@ impl RocksObjectStore {
 
     /// Write data at the given offset within an object.
     /// For simplicity, does a read-modify-write under RocksDB's internal locking.
-    pub async fn write(&self, object_id: &str, offset: u64, data: &[u8]) -> Result<()> {
+    pub async fn write(&self, object_id: &str, data: &[u8]) -> Result<()> {
         let db = Arc::clone(&self.db);
         let key = Self::obj_key(object_id);
-        let offset = offset as usize;
         let data_len = data.len();
         let data = data.to_vec();
         let oid = object_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            // Read existing value
-            let mut buf = match db.get(&key) {
-                Ok(Some(existing)) => existing,
-                Ok(None) => Vec::new(),
-                Err(e) => return Err(RustreError::Internal(format!("RocksDB get: {e}"))),
-            };
-
-            let end = offset + data.len();
-            if buf.len() < end {
-                buf.resize(end, 0);
-            }
-            buf[offset..end].copy_from_slice(&data);
-
-            db.put(&key, &buf)
-                .map_err(|e| RustreError::Internal(format!("RocksDB put: {e}")))?;
-            Ok(())
+            db.put(&key, data)
+                .map_err(|e| RustreError::Internal(format!("RocksDB put: {e}")))
         })
         .await
         .map_err(|e| RustreError::Internal(format!("spawn_blocking: {e}")))??;
 
-        debug!("wrote {data_len} bytes to object {oid} @ offset {offset}");
+        debug!("wrote {data_len} bytes to object {oid}");
         Ok(())
     }
 
     /// Read `length` bytes starting at `offset` from an object.
-    pub async fn read(&self, object_id: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
+    pub async fn read(&self, object_id: &str) -> Result<Vec<u8>> {
         let db = Arc::clone(&self.db);
         let key = Self::obj_key(object_id);
-        let offset = offset as usize;
-        let length = length as usize;
         let oid = object_id.to_string();
 
         tokio::task::spawn_blocking(move || match db.get(&key) {
-            Ok(Some(buf)) => {
-                let start = offset;
-                let end = std::cmp::min(start + length, buf.len());
-                if start >= buf.len() {
-                    Ok(Vec::new())
-                } else {
-                    Ok(buf[start..end].to_vec())
-                }
-            }
+            Ok(Some(buf)) => Ok(buf),
             Ok(None) => Err(RustreError::NotFound(format!("object {oid}"))),
             Err(e) => Err(RustreError::Internal(format!("RocksDB get: {e}"))),
         })
