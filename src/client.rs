@@ -227,8 +227,6 @@ async fn cmd_put(
         // Deterministic object ID and OST assignment
         let object_id = StripeLayout::object_id(meta.ino, chunk_index);
         let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
-        let obj_offset = layout.obj_offset(chunk_index);
-
         let addr = ost_addr(&config, ost_index)?;
 
         write_futures.push(tokio::spawn(async move {
@@ -236,7 +234,6 @@ async fn cmd_put(
                 &addr,
                 RpcKind::ObjWrite(ObjWriteReq {
                     object_id: object_id.clone(),
-                    offset: obj_offset,
                     data: chunk_data,
                 }),
             )
@@ -330,27 +327,12 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     for chunk_index in 0..total_chunks {
         let object_id = StripeLayout::object_id(meta.ino, chunk_index);
         let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
-        let obj_offset = layout.obj_offset(chunk_index);
-
-        // How much to read from this chunk
-        let file_offset = chunk_index as usize * chunk_size;
-        let remaining = file_size - file_offset;
-        let read_len = std::cmp::min(chunk_size, remaining) as u64;
-
         let addr = ost_addr(&config, ost_index)?;
 
         read_futures.push((
             chunk_index as usize,
             tokio::spawn(async move {
-                let result = rpc_call(
-                    &addr,
-                    RpcKind::ObjRead(ObjReadReq {
-                        object_id,
-                        offset: obj_offset,
-                        length: read_len,
-                    }),
-                )
-                .await;
+                let result = rpc_call(&addr, RpcKind::ObjRead(ObjReadReq { object_id })).await;
                 match result {
                     Ok(reply) => match reply.kind {
                         RpcKind::DataReply(data) => Ok(data),
@@ -524,8 +506,7 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
                 for seq in 0..std::cmp::min(total_chunks, 16) {
                     let oid = StripeLayout::object_id(meta.ino, seq);
                     let ost = (layout.stripe_offset + seq) % ost_count;
-                    let obj_off = layout.obj_offset(seq);
-                    println!("      [seq={seq}] object_id={oid} → OST-{ost} @ offset {obj_off}",);
+                    println!("      [seq={seq}] object_id={oid} → OST-{ost}",);
                 }
                 if total_chunks > 16 {
                     println!("      ... ({} more chunks)", total_chunks - 16);

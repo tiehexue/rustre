@@ -80,12 +80,6 @@ impl StripeLayout {
         }
         file_size.div_ceil(self.stripe_size) as u32
     }
-
-    /// Byte offset within an object for a given global stripe sequence.
-    /// Each OST accumulates chunks: obj_offset = (seq / stripe_count) * stripe_size.
-    pub fn obj_offset(&self, stripe_seq: u32) -> u64 {
-        (stripe_seq as u64 / self.stripe_count as u64) * self.stripe_size
-    }
 }
 
 /// Inode-level metadata for a file or directory.
@@ -217,15 +211,12 @@ pub struct CreateReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjWriteReq {
     pub object_id: String,
-    pub offset: u64,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjReadReq {
     pub object_id: String,
-    pub offset: u64,
-    pub length: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
