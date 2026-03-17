@@ -173,8 +173,6 @@ async fn ost_writer_task(
     ost_assignment: u32, // Which OST this task is responsible for (0..stripe_count-1)
 ) -> Result<()> {
     let chunk_size = layout.stripe_size as usize;
-    let ost_count = config.ost_list.len() as u32;
-
     // Open the source file for this task
     let mut file = tokio::fs::File::open(&source_path).await.map_err(|e| {
         RustreError::Io(std::io::Error::new(
@@ -195,8 +193,8 @@ async fn ost_writer_task(
         .len();
     let total_chunks = layout.total_chunks(file_size);
 
-    // Get the OST address for this assignment
-    let ost_index = (layout.stripe_offset + ost_assignment) % ost_count;
+    // Get the OST address for this assignment using the layout's mapping
+    let ost_index = layout.ost_for_chunk(ost_assignment);
     let addr = ost_addr(&config, ost_index)?;
 
     // Process all chunks that belong to this OST
@@ -409,8 +407,6 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
 
     let file_size = meta.size as usize;
     let chunk_size = layout.stripe_size as usize;
-    let ost_count = config.ost_list.len() as u32;
-
     println!(
         "GET: {source} → {dest} ({} bytes, {} stripes, streaming)",
         file_size, layout.stripe_count
@@ -426,7 +422,7 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     // Spawn all reader tasks in parallel
     for chunk_index in 0..total_chunks {
         let object_id = StripeLayout::object_id(meta.ino, chunk_index);
-        let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
+        let ost_index = layout.ost_for_chunk(chunk_index);
         let addr = ost_addr(&config, ost_index)?;
         let tx = tx.clone();
 
@@ -657,7 +653,6 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
             println!("  Created: {}", meta.ctime);
             println!("  Modified:{}", meta.mtime);
             if let Some(layout) = &meta.layout {
-                let ost_count = config.ost_list.len() as u32;
                 let total_chunks = layout.total_chunks(meta.size);
                 println!("  Stripe Layout:");
                 println!("    stripe_count:  {}", layout.stripe_count);
@@ -667,7 +662,7 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
                 println!("    Object mapping (deterministic):");
                 for seq in 0..std::cmp::min(total_chunks, 16) {
                     let oid = StripeLayout::object_id(meta.ino, seq);
-                    let ost = (layout.stripe_offset + seq) % ost_count;
+                    let ost = layout.ost_for_chunk(seq);
                     println!("      [seq={seq}] object_id={oid} → OST-{ost}",);
                 }
                 if total_chunks > 16 {
