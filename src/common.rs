@@ -50,7 +50,8 @@ pub const DEFAULT_STRIPE_SIZE: u64 = 1_048_576;
 ///   object_id(ino, seq) = format!("{:016x}:{:08x}", ino, seq)
 ///   ost_for_chunk(seq)  = (stripe_offset + seq) % total_ost_count
 ///
-/// No need to store a per-chunk object list in metadata.
+/// When stripe_count < total_ost_count, the specific OST indices used
+/// are stored in ost_indices to ensure correct mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StripeLayout {
     /// Number of OSTs the file is striped across
@@ -59,6 +60,10 @@ pub struct StripeLayout {
     pub stripe_size: u64,
     /// Starting OST index (typically ino % ost_count)
     pub stripe_offset: u32,
+    /// Specific OST indices used for this file (when stripe_count < total_ost_count)
+    /// If empty, uses round-robin across all OSTs starting from stripe_offset
+    #[serde(default)]
+    pub ost_indices: Vec<u32>,
 }
 
 impl StripeLayout {
@@ -70,7 +75,14 @@ impl StripeLayout {
     /// Compute which OST a given stripe sequence lands on.
     #[allow(dead_code)]
     pub fn ost_for_chunk(&self, stripe_seq: u32) -> u32 {
-        (self.stripe_offset + stripe_seq) % self.stripe_count
+        if !self.ost_indices.is_empty() {
+            // Use specific OST indices when provided
+            let idx = (stripe_seq as usize) % self.ost_indices.len();
+            self.ost_indices[idx]
+        } else {
+            // Fall back to round-robin across all OSTs
+            (self.stripe_offset + stripe_seq) % self.stripe_count
+        }
     }
 
     /// Total number of stripe chunks for a file of the given size.

@@ -250,10 +250,21 @@ async fn handle_create(
     // Stripe offset: spread files across OSTs for even distribution
     let stripe_offset = (ino as u32) % ost_count;
 
+    // Select specific OST indices when stripe_count < total OST count
+    let mut ost_indices = Vec::new();
+    if stripe_count < ost_count {
+        // Select OST indices starting from stripe_offset, wrapping around
+        for i in 0..stripe_count {
+            let ost_idx = (stripe_offset + i) % ost_count;
+            ost_indices.push(ost_idx);
+        }
+    }
+
     let layout = StripeLayout {
         stripe_count,
         stripe_size,
         stripe_offset,
+        ost_indices,
     };
 
     let now = FileMeta::now_secs();
