@@ -8,6 +8,7 @@
 
 mod client;
 mod common;
+mod logs;
 mod mds;
 mod mgs;
 mod net;
@@ -25,6 +26,10 @@ use client::ClientCommands;
     about = "A parallel distributed file system inspired by Lustre"
 )]
 struct Cli {
+    /// Log level (info, debug, trace, warn, error)
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -80,14 +85,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Parse CLI arguments first
     let cli = Cli::parse();
+
+    // Initialize logging based on the command and log level
+    logs::init_logging(&cli.command, &cli.log_level)?;
 
     match cli.command {
         Commands::Mgs {

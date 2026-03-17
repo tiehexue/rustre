@@ -14,6 +14,7 @@ use crate::common::*;
 use crate::net::rpc_call;
 use clap::Subcommand;
 use futures::future::join_all;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{error, info};
 
 #[derive(Subcommand)]
@@ -163,6 +164,121 @@ pub async fn status(mgs_addr: &str) -> Result<()> {
 // PUT — striped parallel write (using deterministic object IDs)
 // ---------------------------------------------------------------------------
 
+/// Helper function for a single OST writer task
+async fn ost_writer_task(
+    source_path: String,
+    meta_ino: u64,
+    layout: StripeLayout,
+    config: ClusterConfig,
+    ost_assignment: u32, // Which OST this task is responsible for (0..stripe_count-1)
+) -> Result<()> {
+    let chunk_size = layout.stripe_size as usize;
+    let ost_count = config.ost_list.len() as u32;
+
+    // Open the source file for this task
+    let mut file = tokio::fs::File::open(&source_path).await.map_err(|e| {
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("opening {source_path} for OST writer: {e}"),
+        ))
+    })?;
+
+    // Calculate total chunks needed
+    let file_size = tokio::fs::metadata(&source_path)
+        .await
+        .map_err(|e| {
+            RustreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("getting metadata for {source_path}: {e}"),
+            ))
+        })?
+        .len();
+    let total_chunks = layout.total_chunks(file_size);
+
+    // Get the OST address for this assignment
+    let ost_index = (layout.stripe_offset + ost_assignment) % ost_count;
+    let addr = ost_addr(&config, ost_index)?;
+
+    // Process all chunks that belong to this OST
+    let mut chunk_index = ost_assignment; // Start with the first chunk for this OST
+    while chunk_index < total_chunks {
+        // Calculate file offset for this chunk
+        let file_offset = (chunk_index as u64) * (chunk_size as u64);
+
+        // Seek to the correct position in the file
+        file.seek(std::io::SeekFrom::Start(file_offset))
+            .await
+            .map_err(|e| {
+                RustreError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("seeking to offset {file_offset} in {source_path}: {e}"),
+                ))
+            })?;
+
+        // Read the chunk - must read exactly chunk_size bytes or until EOF
+        let mut buffer = vec![0u8; chunk_size];
+        let mut total_read = 0;
+        while total_read < chunk_size {
+            let bytes_read = file.read(&mut buffer[total_read..]).await.map_err(|e| {
+                RustreError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("reading chunk {chunk_index} from {source_path}: {e}"),
+                ))
+            })?;
+
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+            total_read += bytes_read;
+        }
+
+        if total_read == 0 {
+            // EOF reached at start (shouldn't happen if we calculated total_chunks correctly)
+            break;
+        }
+
+        // Trim buffer to actual bytes read
+        buffer.truncate(total_read);
+        let chunk_data = buffer;
+
+        // Deterministic object ID
+        let object_id = StripeLayout::object_id(meta_ino, chunk_index);
+
+        // Send to OSS
+        let result = rpc_call(
+            &addr,
+            RpcKind::ObjWrite(ObjWriteReq {
+                object_id: object_id.clone(),
+                data: chunk_data,
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(reply) => match reply.kind {
+                RpcKind::Ok => {
+                    // Success, continue to next chunk for this OST
+                }
+                RpcKind::Error(e) => {
+                    return Err(RustreError::Net(e));
+                }
+                _ => {
+                    return Err(RustreError::Net("unexpected OSS reply".into()));
+                }
+            },
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        // Move to next chunk for this OST (skip by stripe_count)
+        chunk_index += layout.stripe_count;
+    }
+
+    Ok(())
+}
+
 async fn cmd_put(
     mgs_addr: &str,
     source: &str,
@@ -170,14 +286,16 @@ async fn cmd_put(
     stripe_count: u32,
     stripe_size: u64,
 ) -> Result<()> {
-    // Read the local file
-    let data = tokio::fs::read(source).await.map_err(|e| {
-        RustreError::Io(std::io::Error::new(
-            e.kind(),
-            format!("reading {source}: {e}"),
-        ))
-    })?;
-    let file_size = data.len() as u64;
+    // Get file size first
+    let file_size = tokio::fs::metadata(source)
+        .await
+        .map_err(|e| {
+            RustreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("getting metadata for {source}: {e}"),
+            ))
+        })?
+        .len();
     info!("PUT: {source} → {dest} ({file_size} bytes)");
 
     // Fetch cluster config
@@ -211,45 +329,24 @@ async fn cmd_put(
         meta.ino, layout.stripe_count, layout.stripe_size, layout.stripe_offset
     );
 
-    // Split data into stripe-sized chunks and send to OSTs in parallel.
-    // Object IDs are deterministic: StripeLayout::object_id(ino, stripe_seq).
-    // OST assignment: layout.ost_for_chunk(stripe_seq).
-    let chunk_size = layout.stripe_size as usize;
-    let ost_count = config.ost_list.len() as u32;
+    // Create one task per stripe (layout.stripe_count tasks)
     let mut write_futures = Vec::new();
-
-    let mut offset = 0usize;
-    let mut chunk_index = 0u32;
-    while offset < data.len() {
-        let end = std::cmp::min(offset + chunk_size, data.len());
-        let chunk_data = data[offset..end].to_vec();
-
-        // Deterministic object ID and OST assignment
-        let object_id = StripeLayout::object_id(meta.ino, chunk_index);
-        let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
-        let addr = ost_addr(&config, ost_index)?;
+    for ost_assignment in 0..layout.stripe_count {
+        let source_path = source.to_string();
+        let config_clone = config.clone();
+        let layout_clone = layout.clone();
+        let meta_ino = meta.ino;
 
         write_futures.push(tokio::spawn(async move {
-            let result = rpc_call(
-                &addr,
-                RpcKind::ObjWrite(ObjWriteReq {
-                    object_id: object_id.clone(),
-                    data: chunk_data,
-                }),
+            ost_writer_task(
+                source_path,
+                meta_ino,
+                layout_clone,
+                config_clone,
+                ost_assignment,
             )
-            .await;
-            match result {
-                Ok(reply) => match reply.kind {
-                    RpcKind::Ok => Ok(()),
-                    RpcKind::Error(e) => Err(RustreError::Net(e)),
-                    _ => Err(RustreError::Net("unexpected OSS reply".into())),
-                },
-                Err(e) => Err(e),
-            }
+            .await
         }));
-
-        offset = end;
-        chunk_index += 1;
     }
 
     // Wait for all writes to complete
@@ -258,11 +355,11 @@ async fn cmd_put(
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                error!("Stripe write {i} failed: {e}");
+                error!("OST writer task {i} failed: {e}");
                 return Err(e);
             }
             Err(e) => {
-                error!("Stripe write {i} panicked: {e}");
+                error!("OST writer task {i} panicked: {e}");
                 return Err(RustreError::Internal(format!("write task panicked: {e}")));
             }
         }
