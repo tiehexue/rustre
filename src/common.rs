@@ -64,6 +64,12 @@ pub struct StripeLayout {
     /// If empty, uses round-robin across all OSTs starting from stripe_offset
     #[serde(default)]
     pub ost_indices: Vec<u32>,
+    /// Number of replicas for each stripe (default: 1, no replication)
+    pub replica_count: u32,
+    /// Replica mapping: for each OST index in ost_indices, contains replica_count replica OST indices
+    /// If empty, replicas are not configured or replica_count is 1
+    #[serde(default)]
+    pub replica_map: Vec<Vec<u32>>,
 }
 
 impl StripeLayout {
@@ -218,6 +224,7 @@ pub struct CreateReq {
     pub path: String,
     pub stripe_count: u32,
     pub stripe_size: u64,
+    pub replica_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

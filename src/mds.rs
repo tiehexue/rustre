@@ -20,7 +20,7 @@ use crate::storage::FdbMdsStore;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 struct MdsState {
     store: FdbMdsStore,
@@ -252,11 +252,39 @@ async fn handle_create(
 
     // Select specific OST indices when stripe_count < total OST count
     let mut ost_indices = Vec::new();
-    if stripe_count < ost_count {
-        // Select OST indices starting from stripe_offset, wrapping around
-        for i in 0..stripe_count {
-            let ost_idx = (stripe_offset + i) % ost_count;
-            ost_indices.push(ost_idx);
+    for i in 0..stripe_count {
+        let ost_idx = (stripe_offset + i) % ost_count;
+        ost_indices.push(ost_idx);
+    }
+
+    // Create replica map if replica_count > 1
+    let mut replica_map = Vec::new();
+
+    if req.replica_count > 1 && ost_count > 1 {
+        use rand::seq::SliceRandom;
+        use rand::thread_rng;
+
+        // Get all OST indices
+        let all_ost_indices: Vec<u32> = (0..ost_count).collect();
+
+        for &primary_ost in &ost_indices {
+            let mut replicas = Vec::new();
+            let mut rng = thread_rng();
+
+            // Select replica_count-1 random OSTs (excluding the primary)
+            let mut candidates: Vec<u32> = all_ost_indices
+                .iter()
+                .filter(|&&idx| idx != primary_ost)
+                .copied()
+                .collect();
+
+            candidates.shuffle(&mut rng);
+
+            // Take replica_count-1 replicas (or all available if fewer)
+            let num_replicas = std::cmp::min(req.replica_count as usize - 1, candidates.len());
+            replicas.extend(candidates.iter().take(num_replicas).copied());
+
+            replica_map.push(replicas);
         }
     }
 
@@ -265,7 +293,11 @@ async fn handle_create(
         stripe_size,
         stripe_offset,
         ost_indices,
+        replica_count: req.replica_count,
+        replica_map,
     };
+
+    debug!("CreateReq: {}, {:#?}", req.path, layout);
 
     let now = FileMeta::now_secs();
     let meta = FileMeta {
