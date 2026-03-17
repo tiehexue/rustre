@@ -1,9 +1,23 @@
 //! Logging configuration for Rustre
 
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::sync::Mutex;
-use tracing_subscriber::fmt::time::LocalTime;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+
+/// Custom time formatter that outputs local time with exactly 3 digits for milliseconds
+/// Format: YYYY-MM-DDTHH:MM:SS.mmm+HH:MM
+struct LocalTimeMillis;
+
+impl FormatTime for LocalTimeMillis {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        let now = chrono::Local::now();
+        // Format with exactly 3 digits for milliseconds
+        write!(w, "{}", now.format("%Y-%m-%dT%H:%M:%S%.3f%:z"))
+    }
+}
 
 /// Determine log file name based on subcommand
 pub fn get_log_file_name(command: &crate::Commands) -> String {
@@ -58,12 +72,9 @@ pub fn init_logging(command: &crate::Commands, level: &str) -> anyhow::Result<()
         file: log_file,
     };
 
-    // Create a timer with local time and RFC 3339 format (includes milliseconds)
-    let timer = LocalTime::rfc_3339();
-
     // Initialize tracing with the combined writer and local timer
     tracing_subscriber::fmt()
-        .with_timer(timer)
+        .with_timer(LocalTimeMillis)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
