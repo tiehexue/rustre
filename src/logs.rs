@@ -75,6 +75,8 @@ pub fn init_logging(command: &crate::Commands, level: &str) -> anyhow::Result<()
     // Initialize tracing with the combined writer and local timer
     tracing_subscriber::fmt()
         .with_timer(LocalTimeMillis)
+        .with_file(true)
+        .with_line_number(true)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
