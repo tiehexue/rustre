@@ -14,7 +14,7 @@ use crate::common::*;
 use crate::net::rpc_call;
 use clap::Subcommand;
 use futures::future::join_all;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{error, info};
 
 #[derive(Subcommand)]
@@ -383,7 +383,7 @@ async fn cmd_put(
 }
 
 // ---------------------------------------------------------------------------
-// GET — parallel stripe read (using deterministic object IDs)
+// GET — parallel stripe read with streaming writes (using deterministic object IDs)
 // ---------------------------------------------------------------------------
 
 async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
@@ -412,55 +412,120 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     let ost_count = config.ost_list.len() as u32;
 
     println!(
-        "GET: {source} → {dest} ({} bytes, {} stripes)",
+        "GET: {source} → {dest} ({} bytes, {} stripes, streaming)",
         file_size, layout.stripe_count
     );
 
     // Calculate how many chunks total
     let total_chunks = layout.total_chunks(meta.size);
 
-    // Read all chunks in parallel using deterministic object IDs
-    let mut read_futures = Vec::new();
+    // Create a channel for streaming chunks from readers to writer
+    // Use a bounded channel to control memory usage (buffer up to 4 chunks)
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Result<Vec<u8>>)>(4);
+
+    // Spawn all reader tasks in parallel
     for chunk_index in 0..total_chunks {
         let object_id = StripeLayout::object_id(meta.ino, chunk_index);
         let ost_index = (layout.stripe_offset + chunk_index) % ost_count;
         let addr = ost_addr(&config, ost_index)?;
+        let tx = tx.clone();
 
-        read_futures.push((
-            chunk_index as usize,
-            tokio::spawn(async move {
-                let result = rpc_call(&addr, RpcKind::ObjRead(ObjReadReq { object_id })).await;
-                match result {
-                    Ok(reply) => match reply.kind {
-                        RpcKind::DataReply(data) => Ok(data),
-                        RpcKind::Error(e) => Err(RustreError::Net(e)),
-                        _ => Err(RustreError::Net("unexpected OSS reply".into())),
-                    },
-                    Err(e) => Err(e),
+        tokio::spawn(async move {
+            let result = rpc_call(&addr, RpcKind::ObjRead(ObjReadReq { object_id })).await;
+            let chunk_result = match result {
+                Ok(reply) => match reply.kind {
+                    RpcKind::DataReply(data) => Ok(data),
+                    RpcKind::Error(e) => Err(RustreError::Net(e)),
+                    _ => Err(RustreError::Net("unexpected OSS reply".into())),
+                },
+                Err(e) => Err(e),
+            };
+
+            // Send the result to the writer task
+            if tx.send((chunk_index as usize, chunk_result)).await.is_err() {
+                // Writer task has dropped, which means either success or fatal error
+                error!("Writer task dropped while sending chunk {chunk_index}");
+            }
+        });
+    }
+
+    // Drop our copy of the sender so the channel closes when all readers finish
+    drop(tx);
+
+    // Create or truncate the destination file
+    let mut file = tokio::fs::File::create(dest).await.map_err(|e| {
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("creating destination file {dest}: {e}"),
+        ))
+    })?;
+
+    // Track which chunks we've received and need to write
+    let mut next_chunk_to_write = 0;
+    let mut pending_chunks = std::collections::BTreeMap::new();
+
+    // Process chunks as they arrive, writing them in order
+    while let Some((chunk_index, chunk_result)) = rx.recv().await {
+        match chunk_result {
+            Ok(data) => {
+                // Store the chunk in pending map
+                pending_chunks.insert(chunk_index, data);
+
+                // Write as many consecutive chunks as we have in order
+                while let Some(data) = pending_chunks.remove(&next_chunk_to_write) {
+                    let file_offset = (next_chunk_to_write * chunk_size) as u64;
+                    let copy_len =
+                        std::cmp::min(data.len(), file_size - (next_chunk_to_write * chunk_size));
+
+                    // Seek to the correct position and write the chunk
+                    file.seek(std::io::SeekFrom::Start(file_offset))
+                        .await
+                        .map_err(|e| {
+                            RustreError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!("seeking to offset {file_offset} in {dest}: {e}"),
+                            ))
+                        })?;
+
+                    file.write_all(&data[..copy_len]).await.map_err(|e| {
+                        RustreError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("writing chunk {next_chunk_to_write} to {dest}: {e}"),
+                        ))
+                    })?;
+
+                    next_chunk_to_write += 1;
+
+                    // If we've written all chunks, we're done
+                    if next_chunk_to_write >= total_chunks as usize {
+                        break;
+                    }
                 }
-            }),
-        ));
-    }
-
-    // Collect results in order
-    let mut file_data = vec![0u8; file_size];
-    for (chunk_index, future) in read_futures {
-        let data = future
-            .await
-            .map_err(|e| RustreError::Internal(format!("read task panicked: {e}")))?
-            .map_err(|e| {
+            }
+            Err(e) => {
                 error!("Stripe read chunk {chunk_index} failed: {e}");
-                e
-            })?;
-
-        let file_offset = chunk_index * chunk_size;
-        let copy_len = std::cmp::min(data.len(), file_size - file_offset);
-        file_data[file_offset..file_offset + copy_len].copy_from_slice(&data[..copy_len]);
+                return Err(e);
+            }
+        }
     }
 
-    // Write to local file
-    tokio::fs::write(dest, &file_data).await?;
-    println!("Successfully read {file_size} bytes from {source} to {dest}");
+    // Verify we wrote all chunks
+    if next_chunk_to_write < total_chunks as usize {
+        return Err(RustreError::Internal(format!(
+            "only wrote {}/{} chunks before channel closed",
+            next_chunk_to_write, total_chunks
+        )));
+    }
+
+    // Ensure all data is flushed to disk
+    file.sync_all().await.map_err(|e| {
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("syncing file {dest}: {e}"),
+        ))
+    })?;
+
+    println!("Successfully read {file_size} bytes from {source} to {dest} (streaming)");
     Ok(())
 }
 
