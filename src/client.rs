@@ -15,7 +15,7 @@ use crate::net::rpc_call;
 use clap::Subcommand;
 use futures::future::join_all;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[derive(Subcommand)]
 pub enum ClientCommands {
@@ -34,6 +34,9 @@ pub enum ClientCommands {
         /// Stripe size in bytes
         #[arg(short = 'S', long, default_value = "1048576")]
         stripe_size: u64,
+        /// Replica count
+        #[arg(short = 'R', long, default_value = "1")]
+        replica_count: u32,
     },
     /// Read a file from Rustre to local disk (parallel fetch from OSTs)
     Get {
@@ -117,7 +120,18 @@ pub async fn run(cmd: ClientCommands) -> Result<()> {
             dest,
             stripe_count,
             stripe_size,
-        } => cmd_put(&mgs, &source, &dest, stripe_count, stripe_size).await,
+            replica_count,
+        } => {
+            cmd_put(
+                &mgs,
+                &source,
+                &dest,
+                stripe_count,
+                stripe_size,
+                replica_count,
+            )
+            .await
+        }
         ClientCommands::Get { mgs, source, dest } => cmd_get(&mgs, &source, &dest).await,
         ClientCommands::Ls { mgs, path } => cmd_ls(&mgs, &path).await,
         ClientCommands::Mkdir { mgs, path } => cmd_mkdir(&mgs, &path).await,
@@ -193,9 +207,48 @@ async fn ost_writer_task(
         .len();
     let total_chunks = layout.total_chunks(file_size);
 
-    // Get the OST address for this assignment using the layout's mapping
-    let ost_index = layout.ost_for_chunk(ost_assignment);
-    let addr = ost_addr(&config, ost_index)?;
+    // Get the primary OST address for this assignment using the layout's mapping
+    let primary_ost_index = layout.ost_for_chunk(ost_assignment);
+    let primary_addr = ost_addr(&config, primary_ost_index)?;
+
+    // Get replica OST addresses if replica_count > 1
+    let replica_addrs = if layout.replica_count > 1 && !layout.replica_map.is_empty() {
+        // Find which index in ost_indices corresponds to this primary_ost_index
+        let ost_indices = if layout.ost_indices.is_empty() {
+            // If ost_indices is empty, we're using round-robin
+            // We need to calculate which position this primary_ost_index is in
+            let pos = (primary_ost_index as i64 - layout.stripe_offset as i64)
+                .rem_euclid(layout.stripe_count as i64) as usize;
+            if pos < layout.stripe_count as usize {
+                Some(pos)
+            } else {
+                None
+            }
+        } else {
+            layout
+                .ost_indices
+                .iter()
+                .position(|&idx| idx == primary_ost_index)
+        };
+
+        if let Some(pos) = ost_indices {
+            if pos < layout.replica_map.len() {
+                let mut addrs = Vec::new();
+                for &replica_ost_index in &layout.replica_map[pos] {
+                    if let Ok(addr) = ost_addr(&config, replica_ost_index) {
+                        addrs.push(addr);
+                    }
+                }
+                addrs
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     // Process all chunks that belong to this OST
     let mut chunk_index = ost_assignment; // Start with the first chunk for this OST
@@ -243,20 +296,67 @@ async fn ost_writer_task(
         // Deterministic object ID
         let object_id = StripeLayout::object_id(meta_ino, chunk_index);
 
-        // Send to OSS
-        let result = rpc_call(
-            &addr,
+        // Write to primary OSS
+        let primary_result = rpc_call(
+            &primary_addr,
             RpcKind::ObjWrite(ObjWriteReq {
                 object_id: object_id.clone(),
-                data: chunk_data,
+                data: chunk_data.clone(),
             }),
         )
         .await;
 
-        match result {
+        match primary_result {
             Ok(reply) => match reply.kind {
                 RpcKind::Ok => {
-                    // Success, continue to next chunk for this OST
+                    // Primary write successful, now write to replicas
+                    let mut replica_futures = Vec::new();
+                    for replica_addr in &replica_addrs {
+                        let addr = replica_addr.clone();
+                        let object_id = object_id.clone();
+                        let data = chunk_data.clone();
+                        replica_futures.push(tokio::spawn(async move {
+                            rpc_call(&addr, RpcKind::ObjWrite(ObjWriteReq { object_id, data }))
+                                .await
+                        }));
+                    }
+
+                    // Wait for all replica writes to complete
+                    let replica_results = futures::future::join_all(replica_futures).await;
+                    for (i, result) in replica_results.into_iter().enumerate() {
+                        match result {
+                            Ok(Ok(reply)) => match reply.kind {
+                                RpcKind::Ok => {
+                                    // Replica write successful
+                                    debug!("replica {} write successfully", i);
+                                }
+                                RpcKind::Error(e) => {
+                                    return Err(RustreError::Net(format!(
+                                        "replica {} write failed: {}",
+                                        i, e
+                                    )));
+                                }
+                                _ => {
+                                    return Err(RustreError::Net(format!(
+                                        "unexpected reply from replica {}",
+                                        i
+                                    )));
+                                }
+                            },
+                            Ok(Err(e)) => {
+                                return Err(RustreError::Net(format!(
+                                    "replica {} write error: {}",
+                                    i, e
+                                )));
+                            }
+                            Err(e) => {
+                                return Err(RustreError::Internal(format!(
+                                    "replica {} task panicked: {}",
+                                    i, e
+                                )));
+                            }
+                        }
+                    }
                 }
                 RpcKind::Error(e) => {
                     return Err(RustreError::Net(e));
@@ -283,6 +383,7 @@ async fn cmd_put(
     dest: &str,
     stripe_count: u32,
     stripe_size: u64,
+    replica_count: u32,
 ) -> Result<()> {
     // Get file size first
     let file_size = tokio::fs::metadata(source)
@@ -307,6 +408,7 @@ async fn cmd_put(
             path: dest.to_string(),
             stripe_count,
             stripe_size,
+            replica_count,
         }),
     )
     .await?;
@@ -323,8 +425,12 @@ async fn cmd_put(
         .ok_or_else(|| RustreError::Internal("no stripe layout returned".into()))?;
 
     println!(
-        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={})",
-        meta.ino, layout.stripe_count, layout.stripe_size, layout.stripe_offset
+        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={}, replica_count={})",
+        meta.ino,
+        layout.stripe_count,
+        layout.stripe_size,
+        layout.stripe_offset,
+        layout.replica_count
     );
 
     // Create one task per stripe (layout.stripe_count tasks)
@@ -422,25 +528,94 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     // Spawn all reader tasks in parallel
     for chunk_index in 0..total_chunks {
         let object_id = StripeLayout::object_id(meta.ino, chunk_index);
-        let ost_index = layout.ost_for_chunk(chunk_index);
-        let addr = ost_addr(&config, ost_index)?;
+        let primary_ost_index = layout.ost_for_chunk(chunk_index);
         let tx = tx.clone();
+        let config = config.clone();
+        let layout = layout.clone();
 
         tokio::spawn(async move {
-            let result = rpc_call(&addr, RpcKind::ObjRead(ObjReadReq { object_id })).await;
-            let chunk_result = match result {
-                Ok(reply) => match reply.kind {
-                    RpcKind::DataReply(data) => Ok(data),
-                    RpcKind::Error(e) => Err(RustreError::Net(e)),
-                    _ => Err(RustreError::Net("unexpected OSS reply".into())),
-                },
-                Err(e) => Err(e),
-            };
+            // Try primary OST first
+            let mut addrs_to_try = Vec::new();
 
-            // Send the result to the writer task
-            if tx.send((chunk_index as usize, chunk_result)).await.is_err() {
-                // Writer task has dropped, which means either success or fatal error
-                error!("Writer task dropped while sending chunk {chunk_index}");
+            // Add primary address
+            if let Ok(primary_addr) = ost_addr(&config, primary_ost_index) {
+                addrs_to_try.push(primary_addr);
+            }
+
+            // Add replica addresses if available
+            if layout.replica_count > 1 && !layout.replica_map.is_empty() {
+                // Find which index in ost_indices corresponds to this primary_ost_index
+                let ost_indices = if layout.ost_indices.is_empty() {
+                    // If ost_indices is empty, we're using round-robin
+                    let pos = (primary_ost_index as i64 - layout.stripe_offset as i64)
+                        .rem_euclid(layout.stripe_count as i64)
+                        as usize;
+                    if pos < layout.stripe_count as usize {
+                        Some(pos)
+                    } else {
+                        None
+                    }
+                } else {
+                    layout
+                        .ost_indices
+                        .iter()
+                        .position(|&idx| idx == primary_ost_index)
+                };
+
+                if let Some(pos) = ost_indices {
+                    if pos < layout.replica_map.len() {
+                        for &replica_ost_index in &layout.replica_map[pos] {
+                            if let Ok(addr) = ost_addr(&config, replica_ost_index) {
+                                addrs_to_try.push(addr);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut last_error = None;
+
+            // Try each address in order (primary first, then replicas)
+            for addr in addrs_to_try {
+                let result = rpc_call(
+                    &addr,
+                    RpcKind::ObjRead(ObjReadReq {
+                        object_id: object_id.clone(),
+                    }),
+                )
+                .await;
+                match result {
+                    Ok(reply) => match reply.kind {
+                        RpcKind::DataReply(data) => {
+                            // Success! Send the data and return
+                            if tx.send((chunk_index as usize, Ok(data))).await.is_err() {
+                                error!("Writer task dropped while sending chunk {chunk_index}");
+                            }
+                            return;
+                        }
+                        RpcKind::Error(e) => {
+                            last_error = Some(RustreError::Net(e));
+                            // Continue to next replica
+                            debug!("trying next replica!");
+                            continue;
+                        }
+                        _ => {
+                            last_error = Some(RustreError::Net("unexpected OSS reply".into()));
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
+                    }
+                }
+            }
+
+            // If we get here, all attempts failed
+            let error =
+                last_error.unwrap_or_else(|| RustreError::Net("no OST addresses available".into()));
+            if tx.send((chunk_index as usize, Err(error))).await.is_err() {
+                error!("Writer task dropped while sending error for chunk {chunk_index}");
             }
         });
     }
@@ -658,12 +833,60 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
                 println!("    stripe_count:  {}", layout.stripe_count);
                 println!("    stripe_size:   {} bytes", layout.stripe_size);
                 println!("    stripe_offset: {}", layout.stripe_offset);
+                println!("    replica_count: {}", layout.replica_count);
                 println!("    total_chunks:  {}", total_chunks);
                 println!("    Object mapping (deterministic):");
                 for seq in 0..std::cmp::min(total_chunks, 16) {
                     let oid = StripeLayout::object_id(meta.ino, seq);
                     let ost = layout.ost_for_chunk(seq);
-                    println!("      [seq={seq}] object_id={oid} → OST-{ost}",);
+
+                    // Get replica information
+                    let replica_info = if layout.replica_count > 1 && !layout.replica_map.is_empty()
+                    {
+                        // Find which index in ost_indices corresponds to this ost
+                        let ost_indices = if layout.ost_indices.is_empty() {
+                            // If ost_indices is empty, we're using round-robin
+                            let pos = (ost as i64 - layout.stripe_offset as i64)
+                                .rem_euclid(layout.stripe_count as i64)
+                                as usize;
+                            if pos < layout.stripe_count as usize {
+                                Some(pos)
+                            } else {
+                                None
+                            }
+                        } else {
+                            layout.ost_indices.iter().position(|&idx| idx == ost)
+                        };
+
+                        if let Some(pos) = ost_indices {
+                            if pos < layout.replica_map.len() {
+                                let replicas = &layout.replica_map[pos];
+                                if !replicas.is_empty() {
+                                    format!(
+                                        " (replicas: {})",
+                                        replicas
+                                            .iter()
+                                            .map(|r| r.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    println!(
+                        "      [seq={seq}] object_id={oid} → OST-{}{}",
+                        ost, replica_info
+                    );
                 }
                 if total_chunks > 16 {
                     println!("      ... ({} more chunks)", total_chunks - 16);
