@@ -217,6 +217,10 @@ pub enum RpcKind {
 
     // -- Status --
     GetStatus,
+
+    // -- Heartbeat --
+    Heartbeat,
+    HeartbeatReply,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
