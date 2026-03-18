@@ -22,3 +22,22 @@ rocksdb = "0.24"
 foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"] }
 rand = "0.8"
 chrono = "*"
+
+[profile.release]
+# Optimize for size (alternative: "z" for minimal size, "s" for small)
+opt-level = "z"
+# Enable link time optimization for better code elimination
+lto = true
+# Single codegen unit for better optimization
+codegen-units = 1
+# Strip debug symbols to reduce binary size
+strip = true
+# Use panic = "abort" to avoid panic unwinding overhead
+panic = "abort"
+# Disable incremental compilation for release builds
+incremental = false
+
+[profile.dev]
+# Keep dev builds fast
+opt-level = 0
+debug = true
