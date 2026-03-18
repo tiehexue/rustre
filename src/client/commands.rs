@@ -4,12 +4,12 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum ClientCommands {
-    /// Write a local file into Rustre (striped across OSTs)
+    /// Write a local file or directory into Rustre (striped across OSTs)
     Put {
         /// MGS address
         #[arg(short, long, default_value = "127.0.0.1:9400")]
         mgs: String,
-        /// Local source file path
+        /// Local source file or directory path
         source: String,
         /// Destination path in Rustre namespace
         dest: String,
