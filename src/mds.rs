@@ -121,6 +121,10 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<RwLock<MdsState>>) 
         RpcKind::Unlink(path) => handle_unlink(msg.id, &path, &state).await,
         RpcKind::Stat(path) => handle_lookup(msg.id, &path, &state).await,
         RpcKind::SetSize { path, size } => handle_set_size(msg.id, &path, size, &state).await,
+        RpcKind::Heartbeat => {
+            // Respond to heartbeat immediately
+            Ok(make_reply(msg.id, RpcKind::HeartbeatReply))
+        }
         other => {
             warn!("MDS: unexpected RPC: {other:?}");
             Ok(make_reply(

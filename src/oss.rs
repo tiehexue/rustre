@@ -103,6 +103,11 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<RocksObjectStore>) 
             Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
         },
 
+        RpcKind::Heartbeat => {
+            // Respond to heartbeat immediately
+            make_reply(msg.id, RpcKind::HeartbeatReply)
+        }
+
         other => {
             warn!("OSS: unexpected RPC: {other:?}");
             make_reply(
