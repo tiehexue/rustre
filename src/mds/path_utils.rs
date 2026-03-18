@@ -1,9 +1,17 @@
 //! Path utilities for MDS
 
 /// Normalize path: ensure leading /, remove trailing / (except root)
+/// On Windows, also converts backslashes to forward slashes
 pub fn normalize_path(p: &str) -> String {
+    // Convert backslashes to forward slashes on Windows
+    #[cfg(windows)]
+    let p = p.replace('\\', "/");
+
+    #[cfg(not(windows))]
+    let p = p.to_string();
+
     let p = if p.starts_with('/') {
-        p.to_string()
+        p
     } else {
         format!("/{p}")
     };
@@ -16,6 +24,7 @@ pub fn normalize_path(p: &str) -> String {
 
 /// Get parent path
 pub fn parent_path(p: &str) -> String {
+    let p = normalize_path(p);
     if p == "/" {
         return "/".to_string();
     }
@@ -28,6 +37,7 @@ pub fn parent_path(p: &str) -> String {
 
 /// Get basename
 pub fn basename(p: &str) -> String {
+    let p = normalize_path(p);
     if p == "/" {
         return "/".to_string();
     }
