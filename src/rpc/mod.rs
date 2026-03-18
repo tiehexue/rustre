@@ -117,9 +117,6 @@ pub async fn recv_msg(stream: &mut TcpStream) -> Result<RpcMessage> {
         .await
         .map_err(|e| RustreError::Net(format!("read length: {e}")))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 256 * 1024 * 1024 {
-        return Err(RustreError::Net(format!("message too large: {len} bytes")));
-    }
     let mut buf = vec![0u8; len];
     stream
         .read_exact(&mut buf)
