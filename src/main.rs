@@ -7,16 +7,17 @@
 //!   Client — POSIX-ish CLI that talks to MDS+OSS for file I/O
 
 mod client;
-mod common;
-mod logs;
+mod error;
 mod mds;
 mod mgs;
-mod net;
 mod oss;
+mod rpc;
 mod storage;
+mod types;
+mod utils;
 
 use clap::{Parser, Subcommand};
-use client::ClientCommands;
+use client::commands::ClientCommands;
 
 /// Rustre — a parallel distributed file system
 #[derive(Parser)]
@@ -89,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging based on the command and log level
-    logs::init_logging(&cli.command, &cli.log_level)?;
+    utils::logging::init_logging(&cli.command, &cli.log_level)?;
 
     match cli.command {
         Commands::Mgs {
