@@ -20,12 +20,11 @@ use crate::storage::FdbMdsStore;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 struct MdsState {
     store: FdbMdsStore,
     cluster_config: ClusterConfig,
-    #[allow(dead_code)]
     mgs_addr: String,
 }
 
@@ -228,8 +227,31 @@ async fn handle_create(
         return Err(RustreError::AlreadyExists(path));
     }
 
-    // Compute stripe layout
-    let ost_count = st.cluster_config.ost_list.len() as u32;
+    // Fetch latest OST info from MGS to ensure we have up-to-date available OSTs
+    // This is critical because OSTs may go down and the cached config could be stale
+    let mgs_addr = st.mgs_addr.clone();
+    drop(st); // Release the read lock before making RPC call
+
+    let latest_config = fetch_config(&mgs_addr).await?;
+
+    // Update the cached cluster_config with the latest info
+    {
+        let mut st_write = state.write().await;
+        st_write.cluster_config = latest_config.clone();
+    }
+
+    // Re-acquire read lock for store operations
+    let st = state.read().await;
+
+    // Compute stripe layout using actual available OST indices from latest config
+    // Note: ost_list may have gaps (e.g., [ost-0, ost-2, ost-3] if ost-1 is down)
+    // We must use the actual ost_index values, not positions in the list
+    let available_osts: Vec<u32> = latest_config
+        .ost_list
+        .iter()
+        .map(|ost| ost.ost_index)
+        .collect();
+    let ost_count = available_osts.len() as u32;
     if ost_count == 0 {
         return Err(RustreError::NoOstAvailable);
     }
@@ -247,15 +269,20 @@ async fn handle_create(
     // Allocate inode atomically from FDB
     let ino = st.store.alloc_ino().await?;
 
-    // Stripe offset: spread files across OSTs for even distribution
-    let stripe_offset = (ino as u32) % ost_count;
+    // Stripe offset: spread files across available OSTs for even distribution
+    // This is an index into the available_osts vector, not the absolute OST index
+    let stripe_offset_in_list = (ino as u32) % ost_count;
 
-    // Select specific OST indices when stripe_count < total OST count
+    // Select specific OST indices from available OSTs
+    // ost_indices contains actual OST index values (e.g., [0, 2, 3]), not list positions
     let mut ost_indices = Vec::new();
     for i in 0..stripe_count {
-        let ost_idx = (stripe_offset + i) % ost_count;
-        ost_indices.push(ost_idx);
+        let list_idx = ((stripe_offset_in_list + i) % ost_count) as usize;
+        ost_indices.push(available_osts[list_idx]);
     }
+
+    // The stripe_offset stored should be the first actual OST index used
+    let stripe_offset = ost_indices.first().copied().unwrap_or(0);
 
     // Create replica map if replica_count > 1
     let mut replica_map = Vec::new();
@@ -264,15 +291,12 @@ async fn handle_create(
         use rand::seq::SliceRandom;
         use rand::thread_rng;
 
-        // Get all OST indices
-        let all_ost_indices: Vec<u32> = (0..ost_count).collect();
-
         for &primary_ost in &ost_indices {
             let mut replicas = Vec::new();
             let mut rng = thread_rng();
 
-            // Select replica_count-1 random OSTs (excluding the primary)
-            let mut candidates: Vec<u32> = all_ost_indices
+            // Select replica_count-1 random OSTs from available_osts (excluding the primary)
+            let mut candidates: Vec<u32> = available_osts
                 .iter()
                 .filter(|&&idx| idx != primary_ost)
                 .copied()
@@ -296,8 +320,6 @@ async fn handle_create(
         replica_count: req.replica_count,
         replica_map,
     };
-
-    debug!("CreateReq: {}, {:#?}", req.path, layout);
 
     let now = FileMeta::now_secs();
     let meta = FileMeta {
