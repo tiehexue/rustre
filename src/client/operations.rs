@@ -277,6 +277,44 @@ async fn cmd_put(
     stripe_size: u64,
     replica_count: u32,
 ) -> Result<()> {
+    let metadata = tokio::fs::metadata(source).await.map_err(|e| {
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("getting metadata for {source}: {e}"),
+        ))
+    })?;
+
+    if metadata.is_dir() {
+        put_directory(
+            mgs_addr,
+            source,
+            dest,
+            stripe_count,
+            stripe_size,
+            replica_count,
+        )
+        .await
+    } else {
+        put_file(
+            mgs_addr,
+            source,
+            dest,
+            stripe_count,
+            stripe_size,
+            replica_count,
+        )
+        .await
+    }
+}
+
+async fn put_file(
+    mgs_addr: &str,
+    source: &str,
+    dest: &str,
+    stripe_count: u32,
+    stripe_size: u64,
+    replica_count: u32,
+) -> Result<()> {
     // Get file size first
     let file_size = tokio::fs::metadata(source)
         .await
@@ -378,9 +416,103 @@ async fn cmd_put(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// GET — parallel stripe read with streaming writes (using deterministic object IDs)
-// ---------------------------------------------------------------------------
+async fn put_directory(
+    mgs_addr: &str,
+    source: &str,
+    dest: &str,
+    stripe_count: u32,
+    stripe_size: u64,
+    replica_count: u32,
+) -> Result<()> {
+    use std::path::Path;
+
+    let source_path = Path::new(source);
+
+    async fn walk_and_put(
+        mgs_addr: &str,
+        source_root: &Path,
+        dest_root: &str,
+        current_source: &Path,
+        stripe_count: u32,
+        stripe_size: u64,
+        replica_count: u32,
+    ) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(current_source).await.map_err(|e| {
+            RustreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("reading directory {}: {e}", current_source.display()),
+            ))
+        })?;
+
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            RustreError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "reading directory entry in {}: {e}",
+                    current_source.display()
+                ),
+            ))
+        })? {
+            let entry_path = entry.path();
+            let relative_path = entry_path.strip_prefix(source_root).map_err(|_| {
+                RustreError::Internal(format!(
+                    "failed to compute relative path for {}",
+                    entry_path.display()
+                ))
+            })?;
+            let dest_entry_path = Path::new(dest_root).join(relative_path);
+
+            let metadata = tokio::fs::metadata(&entry_path).await.map_err(|e| {
+                RustreError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("getting metadata for {}: {e}", entry_path.display()),
+                ))
+            })?;
+
+            if metadata.is_dir() {
+                // Create directory on remote
+                cmd_mkdir(mgs_addr, &dest_entry_path.to_string_lossy()).await?;
+                // Recurse
+                Box::pin(walk_and_put(
+                    mgs_addr,
+                    source_root,
+                    dest_root,
+                    &entry_path,
+                    stripe_count,
+                    stripe_size,
+                    replica_count,
+                ))
+                .await?;
+            } else {
+                // Put file
+                put_file(
+                    mgs_addr,
+                    &entry_path.to_string_lossy(),
+                    &dest_entry_path.to_string_lossy(),
+                    stripe_count,
+                    stripe_size,
+                    replica_count,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    // Create the root destination directory if it doesn't exist
+    cmd_mkdir(mgs_addr, dest).await?;
+    // Walk and put
+    walk_and_put(
+        mgs_addr,
+        source_path,
+        dest,
+        source_path,
+        stripe_count,
+        stripe_size,
+        replica_count,
+    )
+    .await
+}
 
 async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     let config = get_config(mgs_addr).await?;
