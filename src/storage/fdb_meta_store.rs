@@ -83,7 +83,6 @@ impl FdbMetaStore {
     }
 
     /// Delete a key.
-    #[allow(dead_code)]
     pub async fn delete(&self, suffix: &str) -> Result<()> {
         let key = self.key(suffix);
 

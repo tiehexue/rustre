@@ -120,24 +120,6 @@ impl FdbMdsStore {
         Ok(())
     }
 
-    /// Delete inode metadata.
-    #[allow(dead_code)]
-    pub async fn delete_inode(&self, ino: u64) -> Result<()> {
-        let key = self.ino_key(ino);
-
-        self.db
-            .run(|trx, _| {
-                let key = key.clone();
-                async move {
-                    trx.clear(&key);
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB delete inode: {e}")))?;
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Path → inode mapping
     // -----------------------------------------------------------------------
@@ -169,83 +151,9 @@ impl FdbMdsStore {
         }
     }
 
-    /// Set a path → inode mapping.
-    #[allow(dead_code)]
-    pub async fn set_path(&self, path: &str, ino: u64) -> Result<()> {
-        let key = self.path_key(path);
-        let data = ino.to_le_bytes().to_vec();
-
-        self.db
-            .run(|trx, _| {
-                let key = key.clone();
-                let data = data.clone();
-                async move {
-                    trx.set(&key, &data);
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB set path: {e}")))?;
-        Ok(())
-    }
-
-    /// Delete a path → inode mapping.
-    #[allow(dead_code)]
-    pub async fn delete_path(&self, path: &str) -> Result<()> {
-        let key = self.path_key(path);
-
-        self.db
-            .run(|trx, _| {
-                let key = key.clone();
-                async move {
-                    trx.clear(&key);
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB delete path: {e}")))?;
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Children (directory entries)
     // -----------------------------------------------------------------------
-
-    /// Add a child inode to a parent directory.
-    #[allow(dead_code)]
-    pub async fn add_child(&self, parent_ino: u64, child_ino: u64) -> Result<()> {
-        let key = self.child_key(parent_ino, child_ino);
-
-        self.db
-            .run(|trx, _| {
-                let key = key.clone();
-                async move {
-                    trx.set(&key, &[]); // empty value — existence is membership
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB add child: {e}")))?;
-        Ok(())
-    }
-
-    /// Remove a child inode from a parent directory.
-    #[allow(dead_code)]
-    pub async fn remove_child(&self, parent_ino: u64, child_ino: u64) -> Result<()> {
-        let key = self.child_key(parent_ino, child_ino);
-
-        self.db
-            .run(|trx, _| {
-                let key = key.clone();
-                async move {
-                    trx.clear(&key);
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB remove child: {e}")))?;
-        Ok(())
-    }
 
     /// List all child inode numbers of a parent directory.
     pub async fn list_children(&self, parent_ino: u64) -> Result<Vec<u64>> {
