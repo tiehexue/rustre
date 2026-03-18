@@ -41,7 +41,6 @@ impl StripeLayout {
     }
 
     /// Compute which OST a given stripe sequence lands on.
-    #[allow(dead_code)]
     pub fn ost_for_chunk(&self, stripe_seq: u32) -> u32 {
         if !self.ost_indices.is_empty() {
             // Use specific OST indices when provided
