@@ -2,13 +2,10 @@
 
 use crate::client::commands::ClientCommands;
 use crate::error::{Result, RustreError};
-use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, MSG_COUNTER};
+use crate::rpc::{rpc_call, RpcKind};
 use crate::types::{ClusterConfig, CreateReq, ObjReadReq, ObjWriteReq, StripeLayout};
-use crate::zerocopy::send_file;
 use futures::future::join_all;
-use std::os::fd::AsRawFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
 /// Fetch cluster config from MGS.
@@ -274,6 +271,7 @@ async fn ost_writer_task(
 }
 
 /// Helper function for a single OST writer task using zero-copy sendfile
+#[cfg(target_os = "macos")]
 async fn ost_zerocopy_task(
     source_path: String,
     meta_ino: u64,
@@ -281,6 +279,9 @@ async fn ost_zerocopy_task(
     config: ClusterConfig,
     ost_assignment: u32, // Which OST this task is responsible for (0..stripe_count-1)
 ) -> Result<()> {
+    use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, MSG_COUNTER};
+    use crate::zerocopy::send_file;
+
     let chunk_size = layout.stripe_size as usize;
     // Open the source file for this task using std::fs to get RawFd
     let file = std::fs::File::open(&source_path).map_err(|e| {

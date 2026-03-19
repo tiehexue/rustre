@@ -1,15 +1,16 @@
-use std::os::fd::RawFd;
-
-use crate::error::RustreError;
-use std::io;
-use tracing::{debug, error};
-
+#[cfg(target_os = "macos")]
 pub fn send_file(
     file_fd: RawFd,
     socket_fd: RawFd,
     offset: u64,
     length: usize,
 ) -> Result<usize, RustreError> {
+    use std::os::fd::RawFd;
+
+    use crate::error::RustreError;
+    use std::io;
+    use tracing::{debug, error};
+
     // Save current socket flags and set to blocking mode for sendfile
     let flags = unsafe { libc::fcntl(socket_fd, libc::F_GETFL) };
     if flags < 0 {
