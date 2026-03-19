@@ -25,6 +25,9 @@ chrono = "*"
 libc = "0.2"
 nix = { version = "0.28", features = ["fs", "socket"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
 [profile.release]
 # Optimize for size (alternative: "z" for minimal size, "s" for small)
 opt-level = "z"
