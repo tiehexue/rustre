@@ -28,6 +28,8 @@ pub enum RustreError {
     Internal(String),
     #[error("FoundationDB error: {0}")]
     Fdb(String),
+    #[error("Zero copy error: {0}")]
+    ZeroCopyError(String),
 }
 
 pub type Result<T> = std::result::Result<T, RustreError>;

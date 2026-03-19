@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, trace};
+use tracing::trace;
 
-static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub(crate) static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // RPC messages — the wire protocol between all components
@@ -55,6 +55,11 @@ pub enum RpcKind {
     // -- OSS RPCs --
     ObjWrite(ObjWriteReq),
     ObjRead(ObjReadReq),
+    /// Zero-copy object write request (metadata only, data follows via sendfile)
+    ObjWriteZeroCopy {
+        object_id: String,
+        length: usize,
+    },
     ObjDelete {
         object_id: String,
     },
@@ -139,7 +144,7 @@ pub async fn rpc_call(addr: &str, kind: RpcKind) -> Result<RpcMessage> {
     };
     send_msg(&mut stream, &msg).await?;
     let reply = recv_msg(&mut stream).await?;
-    debug!("rpc_call to {addr} done, reply id={}", reply.id);
+    trace!("rpc_call to {addr} done, reply id={}", reply.id);
     Ok(reply)
 }
 

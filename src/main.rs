@@ -15,6 +15,7 @@ mod rpc;
 mod storage;
 mod types;
 mod utils;
+mod zerocopy;
 
 use clap::{Parser, Subcommand};
 use client::commands::ClientCommands;

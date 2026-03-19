@@ -22,6 +22,8 @@ rocksdb = "0.24"
 foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"] }
 rand = "0.8"
 chrono = "*"
+libc = "0.2"
+nix = { version = "0.28", features = ["fs", "socket"] }
 
 [profile.release]
 # Optimize for size (alternative: "z" for minimal size, "s" for small)

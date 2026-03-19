@@ -12,8 +12,9 @@ use crate::rpc::{make_reply, recv_msg, rpc_call, send_msg, RpcKind};
 use crate::storage::RocksObjectStore;
 use crate::types::OstInfo;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub async fn run(listen: &str, mgs_addr: &str, data_dir: &str, ost_index: u32) -> Result<()> {
     let store = RocksObjectStore::new(data_dir)?;
@@ -88,6 +89,40 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<RocksObjectStore>) 
             Ok(()) => make_reply(msg.id, RpcKind::Ok),
             Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
         },
+
+        RpcKind::ObjWriteZeroCopy { object_id, length } => {
+            // Read the data that was sent via sendfile after the RPC message
+            let mut data = vec![0u8; length];
+            match stream.read_exact(&mut data).await {
+                Ok(bytes_read) => {
+                    if bytes_read != length {
+                        make_reply(
+                            msg.id,
+                            RpcKind::Error(format!(
+                                "short read: expected {} bytes, got {}",
+                                length, bytes_read
+                            )),
+                        )
+                    } else {
+                        debug!(
+                            "OSS: received zero-copy write for object {object_id}:{} ({} bytes)",
+                            length, bytes_read
+                        );
+                        match store.write(&object_id, &data).await {
+                            Ok(()) => make_reply(msg.id, RpcKind::Ok),
+                            Err(e) => make_reply(msg.id, RpcKind::Error(e.to_string())),
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Failed to read data, send error reply
+                    make_reply(
+                        msg.id,
+                        RpcKind::Error(format!("failed to read zero-copy data: {}", e)),
+                    )
+                }
+            }
+        }
 
         RpcKind::ObjRead(req) => match store.read(&req.object_id).await {
             Ok(data) => make_reply(msg.id, RpcKind::DataReply(data)),
