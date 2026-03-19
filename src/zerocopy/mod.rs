@@ -1,13 +1,16 @@
 #[cfg(target_os = "macos")]
+use std::os::fd::RawFd;
+
+#[cfg(target_os = "macos")]
+use crate::error::RustreError;
+
+#[cfg(target_os = "macos")]
 pub fn send_file(
     file_fd: RawFd,
     socket_fd: RawFd,
     offset: u64,
     length: usize,
 ) -> Result<usize, RustreError> {
-    use std::os::fd::RawFd;
-
-    use crate::error::RustreError;
     use std::io;
     use tracing::{debug, error};
 
