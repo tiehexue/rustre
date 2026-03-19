@@ -1,3 +1,10 @@
+//! Zero-copy file transfer implementations for Rustre
+//!
+//! This module provides platform-specific zero-copy file transfer functions
+//! using sendfile() on Unix-like systems and TransmitFile() on Windows.
+
+pub mod transfer;
+
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
 
