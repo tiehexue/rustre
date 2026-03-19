@@ -279,8 +279,10 @@ async fn ost_zerocopy_task(
     config: ClusterConfig,
     ost_assignment: u32, // Which OST this task is responsible for (0..stripe_count-1)
 ) -> Result<()> {
-    use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, MSG_COUNTER};
+    use crate::rpc::{recv_msg, send_msg, RpcKind, MSG_COUNTER};
     use crate::zerocopy::send_file;
+    use std::os::fd::AsRawFd;
+    use tokio::net::TcpStream;
 
     let chunk_size = layout.stripe_size as usize;
     // Open the source file for this task using std::fs to get RawFd
