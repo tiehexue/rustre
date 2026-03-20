@@ -4,7 +4,6 @@ use crate::client::operations::ost_addr;
 use crate::error::{Result, RustreError};
 use crate::rpc::{recv_msg, send_msg, RpcKind, MSG_COUNTER};
 use crate::types::{ClusterConfig, StripeLayout};
-use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -139,7 +138,7 @@ async fn macos_zerocopy_transfer(
     actual_chunk_size: usize,
 ) -> Result<()> {
     use crate::zerocopy::send_file;
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::AsRawFd;
 
     // Open the source file for this task using std::fs to get RawFd
     let file = std::fs::File::open(source_path).map_err(|e| {
@@ -314,6 +313,7 @@ async fn windows_zerocopy_transfer(
 ) -> Result<()> {
     use crate::zerocopy::send_file;
     use std::os::windows::io::AsRawSocket;
+    use std::sync::Arc;
 
     // Open the source file for this task using std::fs to get File
     let file = std::fs::File::open(source_path).map_err(|e| {
