@@ -20,7 +20,7 @@ async fn zerocopy_transfer(
 ) -> Result<()> {
     // Platform-specific setup
     #[cfg(target_os = "macos")]
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::AsRawFd;
 
     #[cfg(target_os = "windows")]
     use std::sync::Arc;
@@ -32,16 +32,12 @@ async fn zerocopy_transfer(
 
     // Open the source file (platform-specific)
     #[cfg(target_os = "macos")]
-    let (file, file_descriptor) = {
-        let file = std::fs::File::open(source_path).map_err(|e| {
-            RustreError::Io(std::io::Error::new(
-                e.kind(),
-                format!("opening {source_path} for OST zero-copy writer: {e}"),
-            ))
-        })?;
-        let fd = file.as_raw_fd();
-        (file, fd)
-    };
+    let file = std::fs::File::open(source_path).map_err(|e| {
+        RustreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("opening {source_path} for OST zero-copy writer: {e}"),
+        ))
+    })?;
 
     #[cfg(target_os = "windows")]
     let (file, file_descriptor) = {
@@ -81,13 +77,23 @@ async fn zerocopy_transfer(
     // Perform zero-copy transfer (spawn_blocking to avoid blocking async runtime)
     let sendfile_result = {
         #[cfg(target_os = "macos")]
-        let file_fd = file_descriptor;
+        let file_clone = file.try_clone().map_err(|e| {
+            RustreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cloning file handle for primary transfer: {e}"),
+            ))
+        })?;
         #[cfg(target_os = "windows")]
         let file_ref = file_descriptor;
 
         tokio::task::spawn_blocking(move || {
             #[cfg(target_os = "macos")]
-            return send_file(file_fd, socket_descriptor, file_offset, actual_chunk_size);
+            return send_file(
+                file_clone.as_raw_fd(),
+                socket_descriptor,
+                file_offset,
+                actual_chunk_size,
+            );
 
             #[cfg(target_os = "windows")]
             return send_file(&file_ref, socket_descriptor, file_offset, actual_chunk_size);
@@ -124,7 +130,12 @@ async fn zerocopy_transfer(
                 let object_id = object_id.to_string();
 
                 #[cfg(target_os = "macos")]
-                let file_fd = file_descriptor;
+                let file_clone = file.try_clone().map_err(|e| {
+                    RustreError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cloning file handle for replica transfer: {e}"),
+                    ))
+                })?;
                 #[cfg(target_os = "windows")]
                 let file_clone = Arc::clone(&file);
 
@@ -154,7 +165,12 @@ async fn zerocopy_transfer(
                     // Perform zero-copy transfer to replica (spawn_blocking)
                     let sendfile_result = tokio::task::spawn_blocking(move || {
                         #[cfg(target_os = "macos")]
-                        return send_file(file_fd, socket_fd, file_offset, actual_chunk_size);
+                        return send_file(
+                            file_clone.as_raw_fd(),
+                            socket_fd,
+                            file_offset,
+                            actual_chunk_size,
+                        );
 
                         #[cfg(target_os = "windows")]
                         return send_file(&file_clone, socket, file_offset, actual_chunk_size);
