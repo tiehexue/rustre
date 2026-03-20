@@ -13,6 +13,7 @@
 pub mod commands;
 pub mod operations;
 pub mod put;
+pub mod rm;
 pub mod status;
 
 pub use operations::run;
