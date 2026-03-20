@@ -1,21 +1,21 @@
-//! File-backed object store for OSS - enables zero-copy for both reads and writes
+//! File-backed object store for OSS — enables zero-copy reads and writes.
 //!
-//! Objects are stored as plain files in a directory structure:
-//!   {data_dir}/objects/{ino_prefix}/{ino}_{chunk_index}
+//! Objects are stored as plain files:
+//!   `{data_dir}/objects/{ino_prefix}/{ino}_{chunk_index}`
 //!
-//! Example: object "0000000000000001:00000005" → objects/00000000000/0000000000000001_00000005
+//! Example: object `0000000000000001:00000005` → `objects/00000000000/0000000000000001_00000005`
 //!
-//! This enables:
-//! - Zero-copy writes: client sendfile() → OSS recv() directly to file (with splice on Linux)
-//! - Zero-copy reads: OSS sendfile() directly from file → client socket
+//! Because objects are ordinary files, the kernel can sendfile() them directly
+//! between disk and socket — no userspace copies needed.
 
 use crate::error::{Result, RustreError};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
-static PREFIX_LEN: usize = 11; // Number of chars from object_id to use as subdirectory prefix
+/// Number of leading hex chars from object_id used as subdirectory prefix.
+const PREFIX_LEN: usize = 11;
 
 /// File-backed object store that enables zero-copy operations
 pub struct FileObjectStore {
@@ -61,31 +61,30 @@ impl FileObjectStore {
         Ok(())
     }
 
-    /// Write data to object (traditional copy-based write)
+    /// Write data to an object file (copy-based, synced to disk).
     pub async fn write(&self, object_id: &str, data: &[u8]) -> Result<()> {
         self.ensure_subdir(object_id)?;
         let path = self.object_path(object_id);
         let data_len = data.len();
         let data = data.to_vec();
-        let path_clone = path.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut file = File::create(&path_clone).map_err(|e| {
+            let mut file = File::create(&path).map_err(|e| {
                 RustreError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("creating file {}: {e}", path_clone.display()),
+                    format!("creating {}: {e}", path.display()),
                 ))
             })?;
             file.write_all(&data).map_err(|e| {
                 RustreError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("writing to {}: {e}", path_clone.display()),
+                    format!("writing {}: {e}", path.display()),
                 ))
             })?;
             file.sync_all().map_err(|e| {
                 RustreError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("syncing {}: {e}", path_clone.display()),
+                    format!("syncing {}: {e}", path.display()),
                 ))
             })?;
             Ok::<(), RustreError>(())
@@ -97,8 +96,7 @@ impl FileObjectStore {
         Ok(())
     }
 
-    /// Open object file for zero-copy operations
-    /// Returns (File, length) for use with sendfile
+    /// Open an object file for zero-copy read. Returns `(File, file_length)` for use with sendfile.
     pub fn open_for_zerocopy(&self, object_id: &str) -> Result<(File, u64)> {
         let path = self.object_path(object_id);
         let file = File::open(&path).map_err(|e| {
@@ -192,7 +190,7 @@ impl FileObjectStore {
                 return Ok(total);
             }
 
-            fn scan_dir(dir: &PathBuf, total: &mut u64) -> std::io::Result<()> {
+            fn scan_dir(dir: &Path, total: &mut u64) -> std::io::Result<()> {
                 for entry in fs::read_dir(dir)? {
                     let entry = entry?;
                     let path = entry.path();

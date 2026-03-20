@@ -28,20 +28,13 @@ nix = { version = "0.28", features = ["fs", "socket"] }
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [profile.release]
-# Optimize for size (alternative: "z" for minimal size, "s" for small)
-opt-level = "z"
-# Enable link time optimization for better code elimination
-lto = true
-# Single codegen unit for better optimization
-codegen-units = 1
-# Strip debug symbols to reduce binary size
-strip = true
-# Use panic = "abort" to avoid panic unwinding overhead
-panic = "abort"
-# Disable incremental compilation for release builds
-incremental = false
+opt-level = "z"       # optimize for size
+lto = true            # link-time optimization
+codegen-units = 1     # single codegen unit for better optimization
+strip = true          # strip debug symbols
+panic = "abort"       # no unwinding overhead
+incremental = false   # disable incremental for release
 
 [profile.dev]
-# Keep dev builds fast
 opt-level = 0
 debug = true

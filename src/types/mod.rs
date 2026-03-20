@@ -59,6 +59,36 @@ impl StripeLayout {
         }
         file_size.div_ceil(self.stripe_size) as u32
     }
+
+    /// Find the position of a given primary OST in the stripe layout.
+    ///
+    /// Returns the index into `ost_indices` (or the computed round-robin position)
+    /// for the given primary OST index.
+    fn position_of_ost(&self, primary_ost_index: u32) -> Option<usize> {
+        if !self.ost_indices.is_empty() {
+            self.ost_indices
+                .iter()
+                .position(|&idx| idx == primary_ost_index)
+        } else {
+            let pos = (primary_ost_index as i64 - self.stripe_offset as i64)
+                .rem_euclid(self.stripe_count as i64) as usize;
+            (pos < self.stripe_count as usize).then_some(pos)
+        }
+    }
+
+    /// Collect replica OST indices for a given primary OST index.
+    ///
+    /// Returns an empty vec when replication is disabled (replica_count ≤ 1)
+    /// or when the primary OST has no configured replicas.
+    pub fn replica_ost_indices(&self, primary_ost_index: u32) -> Vec<u32> {
+        if self.replica_count <= 1 || self.replica_map.is_empty() {
+            return Vec::new();
+        }
+        self.position_of_ost(primary_ost_index)
+            .and_then(|pos| self.replica_map.get(pos))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// Inode-level metadata for a file or directory.

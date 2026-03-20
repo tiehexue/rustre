@@ -7,9 +7,7 @@ use crate::types::{ClusterConfig, StripeLayout};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// Unified zero-copy transfer implementation that works on both macOS and Windows
-///
-/// This function extracts the common logic from the platform-specific implementations.
+/// Send one chunk to a primary OST (and its replicas) via zero-copy.
 async fn zerocopy_transfer(
     source_path: &str,
     primary_addr: &str,
@@ -251,7 +249,7 @@ async fn zerocopy_transfer(
     Ok(())
 }
 
-/// Unified zero-copy OST writer task that works on both macOS and Windows
+/// Per-OST writer task: sends all chunks assigned to one OST via zero-copy.
 pub async fn ost_zerocopy_task(
     source_path: String,
     meta_ino: u64,
@@ -277,44 +275,12 @@ pub async fn ost_zerocopy_task(
     let primary_ost_index = layout.ost_for_chunk(ost_assignment);
     let primary_addr = ost_addr(&config, primary_ost_index)?;
 
-    // Get replica OST addresses if replica_count > 1
-    let replica_addrs = if layout.replica_count > 1 && !layout.replica_map.is_empty() {
-        // Find which index in ost_indices corresponds to this primary_ost_index
-        let ost_indices = if layout.ost_indices.is_empty() {
-            // If ost_indices is empty, we're using round-robin
-            // We need to calculate which position this primary_ost_index is in
-            let pos = (primary_ost_index as i64 - layout.stripe_offset as i64)
-                .rem_euclid(layout.stripe_count as i64) as usize;
-            if pos < layout.stripe_count as usize {
-                Some(pos)
-            } else {
-                None
-            }
-        } else {
-            layout
-                .ost_indices
-                .iter()
-                .position(|&idx| idx == primary_ost_index)
-        };
-
-        if let Some(pos) = ost_indices {
-            if pos < layout.replica_map.len() {
-                let mut addrs = Vec::new();
-                for &replica_ost_index in &layout.replica_map[pos] {
-                    if let Ok(addr) = ost_addr(&config, replica_ost_index) {
-                        addrs.push(addr);
-                    }
-                }
-                addrs
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    // Collect replica OST addresses (empty when replication is disabled)
+    let replica_addrs: Vec<String> = layout
+        .replica_ost_indices(primary_ost_index)
+        .into_iter()
+        .filter_map(|idx| ost_addr(&config, idx).ok())
+        .collect();
 
     // Process all chunks that belong to this OST
     let mut chunk_index = ost_assignment; // Start with the first chunk for this OST
@@ -334,8 +300,7 @@ pub async fn ost_zerocopy_task(
         // Deterministic object ID
         let object_id = StripeLayout::object_id(meta_ino, chunk_index);
 
-        // Use unified zero-copy transfer implementation
-        let result = zerocopy_transfer(
+        zerocopy_transfer(
             &source_path,
             &primary_addr,
             &replica_addrs,
@@ -343,17 +308,10 @@ pub async fn ost_zerocopy_task(
             file_offset,
             actual_chunk_size,
         )
-        .await;
+        .await?;
 
-        match result {
-            Ok(_) => {
-                // Move to next chunk for this OST (skip by stripe_count)
-                chunk_index += layout.stripe_count;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
+        // Advance to next chunk for this OST (skip by stripe_count)
+        chunk_index += layout.stripe_count;
     }
 
     Ok(())

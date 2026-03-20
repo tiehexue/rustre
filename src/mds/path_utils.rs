@@ -1,17 +1,17 @@
-//! Path utilities for MDS
+//! Path utilities for MDS.
 
-/// Normalize path: ensure leading /, remove trailing / (except root)
-/// On Windows, also converts backslashes to forward slashes
+use std::borrow::Cow;
+
+/// Normalize path: ensure leading `/`, remove trailing `/` (except root).
+/// On Windows, converts backslashes to forward slashes.
 pub fn normalize_path(p: &str) -> String {
-    // Convert backslashes to forward slashes on Windows
-    #[cfg(windows)]
-    let p = p.replace('\\', "/");
-
-    #[cfg(not(windows))]
-    let p = p.to_string();
-
+    let p: Cow<str> = if cfg!(windows) {
+        Cow::Owned(p.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(p)
+    };
     let p = if p.starts_with('/') {
-        p
+        p.into_owned()
     } else {
         format!("/{p}")
     };
@@ -22,7 +22,7 @@ pub fn normalize_path(p: &str) -> String {
     }
 }
 
-/// Get parent path
+/// Parent path: `"/a/b/c"` → `"/a/b"`, `"/a"` → `"/"`.
 pub fn parent_path(p: &str) -> String {
     let p = normalize_path(p);
     if p == "/" {
@@ -35,7 +35,7 @@ pub fn parent_path(p: &str) -> String {
     }
 }
 
-/// Get basename
+/// Basename: `"/a/b/c"` → `"c"`, `"/"` → `"/"`.
 pub fn basename(p: &str) -> String {
     let p = normalize_path(p);
     if p == "/" {
