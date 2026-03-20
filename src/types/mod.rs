@@ -124,19 +124,6 @@ pub struct CreateReq {
     pub replica_count: u32,
 }
 
-/// Object write request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjWriteReq {
-    pub object_id: String,
-    pub data: Vec<u8>,
-}
-
-/// Object read request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjReadReq {
-    pub object_id: String,
-}
-
 /// Status information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusInfo {
