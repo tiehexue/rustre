@@ -77,9 +77,24 @@ pub enum RpcKind {
 
     // -- Status + Heartbeat --
     // NOTE: variant order is load-bearing — bincode uses ordinals on the wire.
+    // New variants MUST be appended at the end to preserve wire compatibility.
     GetStatus,
     Heartbeat,
     HeartbeatReply,
+
+    // -- Two-phase commit for data integrity --
+    /// Commit a pending file: set final size and mark as visible.
+    /// Sent by client after all OSS writes succeed.
+    /// Uses ino directly — no redundant path resolution.
+    CommitCreate {
+        ino: u64,
+        size: u64,
+    },
+    /// Abort a pending file: remove the MDS record.
+    /// Sent by client if OSS writes fail (best-effort cleanup).
+    AbortCreate {
+        ino: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

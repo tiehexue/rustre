@@ -112,6 +112,11 @@ pub struct FileMeta {
     pub layout: Option<StripeLayout>,
     /// Parent inode number
     pub parent_ino: u64,
+    /// Write-intent flag: true while data is still being written to OSS.
+    /// Pending files are invisible to Stat/Readdir/Lookup and will be
+    /// garbage-collected if never committed (client crash recovery).
+    #[serde(default)]
+    pub pending: bool,
 }
 
 impl FileMeta {

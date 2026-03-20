@@ -344,6 +344,7 @@ impl FdbMdsStore {
             mtime: crate::types::FileMeta::now_secs(),
             layout: None,
             parent_ino: 0,
+            pending: false,
         };
 
         // Atomically set root inode + path + next_ino in one transaction
