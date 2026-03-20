@@ -1,9 +1,8 @@
 //! Storage engines for Rustre.
 //!
-//! - `FileObjectStore`: File-backed object storage for OSS (enables zero-copy reads/writes).
-//! - `RocksObjectStore`: RocksDB-backed object storage for OSS (legacy).
-//! - `FdbMetaStore`: FoundationDB-backed metadata store for MGS (distributed, HA).
-//! - `FdbMdsStore`: FoundationDB-backed metadata store for MDS (distributed, stateless HA).
+//! - [`FileObjectStore`]: File-backed object storage for OSS (zero-copy reads/writes).
+//! - [`FdbMetaStore`]: FoundationDB-backed cluster state store for MGS.
+//! - [`FdbMdsStore`]: FoundationDB-backed metadata store for MDS.
 
 pub mod fdb_mds_store;
 pub mod fdb_meta_store;
