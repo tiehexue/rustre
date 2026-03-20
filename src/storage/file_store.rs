@@ -15,6 +15,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing::debug;
 
+static PREFIX_LEN: usize = 11; // Number of chars from object_id to use as subdirectory prefix
+
 /// File-backed object store that enables zero-copy operations
 pub struct FileObjectStore {
     data_dir: PathBuf,
@@ -39,7 +41,7 @@ impl FileObjectStore {
     /// object_id format: "{ino:016x}:{chunk:08x}" e.g. "0000000000000001:00000005"
     fn object_path(&self, object_id: &str) -> PathBuf {
         // Use first 11 chars of ino as subdirectory for better filesystem performance
-        let prefix = &object_id[..11.min(object_id.len())];
+        let prefix = &object_id[..PREFIX_LEN.min(object_id.len())];
         // Replace : with _ for filename
         let filename = object_id.replace(':', "_");
         self.data_dir.join("objects").join(prefix).join(filename)
@@ -143,7 +145,7 @@ impl FileObjectStore {
     /// Delete all objects for a given inode (prefix scan)
     pub async fn delete_inode(&self, ino: u64) -> Result<()> {
         let prefix = format!("{:016x}_", ino);
-        let prefix_dir = format!("{:02x}", (ino >> 56) as u8); // First 2 hex chars
+        let prefix_dir = prefix[..PREFIX_LEN.min(prefix.len())].to_string();
         let search_dir = self.data_dir.join("objects").join(&prefix_dir);
 
         tokio::task::spawn_blocking(move || {
