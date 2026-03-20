@@ -32,7 +32,6 @@ pub enum RpcKind {
     RegisterMds(MdsInfo),
     RegisterOst(OstInfo),
     GetConfig,
-    GetConfigReply(ClusterConfig),
     UpdateOstUsage {
         ost_index: u32,
         used_bytes: u64,

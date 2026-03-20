@@ -103,7 +103,7 @@ async fn put_file(
         layout.replica_count
     );
 
-    // Create one task per stripe (layout.stripe_count tasks)
+    // Create one task per stripe — each task uses zero-copy transfer
     let mut write_futures = Vec::new();
     for ost_assignment in 0..layout.stripe_count {
         let source_path = source.to_string();
@@ -111,19 +111,6 @@ async fn put_file(
         let layout_clone = layout.clone();
         let meta_ino = meta.ino;
 
-        #[cfg(target_os = "macos")]
-        write_futures.push(tokio::spawn(async move {
-            crate::zerocopy::transfer::ost_zerocopy_task(
-                source_path,
-                meta_ino,
-                layout_clone,
-                config_clone,
-                ost_assignment,
-            )
-            .await
-        }));
-
-        #[cfg(target_os = "windows")]
         write_futures.push(tokio::spawn(async move {
             crate::zerocopy::transfer::ost_zerocopy_task(
                 source_path,

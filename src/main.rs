@@ -1,10 +1,10 @@
 //! Rustre — A parallel, distributed file system inspired by Lustre.
 //!
 //! Architecture overview:
-//!   MGS  — Management Server: stores cluster config in FoundationDB (stateless, HA)
-//!   MDS  — Metadata Server: handles namespace ops in FoundationDB (stateless, HA)
-//!   OSS  — Object Storage Server: stores file data in RocksDB
-//!   Client — POSIX-ish CLI that talks to MDS+OSS for file I/O
+//!   MGS    — Management Server: cluster config in FoundationDB (stateless, HA)
+//!   MDS    — Metadata Server: namespace ops via FoundationDB (stateless, HA)
+//!   OSS    — Object Storage Server: file data on local filesystem (zero-copy)
+//!   Client — CLI that talks to MDS for metadata + OSS for data I/O
 
 mod client;
 mod error;
@@ -59,7 +59,7 @@ enum Commands {
         #[arg(short, long, default_value = "rustre")]
         cluster_name: String,
     },
-    /// Start an Object Storage Server (OSS) — backed by RocksDB
+    /// Start an Object Storage Server (OSS) — file-backed, zero-copy enabled
     Oss {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9402")]
@@ -67,7 +67,7 @@ enum Commands {
         /// MGS address to register with
         #[arg(short, long, default_value = "127.0.0.1:9400")]
         mgs: String,
-        /// Data directory for RocksDB storage
+        /// Data directory for object storage
         #[arg(short, long, default_value = "/tmp/rustre/oss")]
         data_dir: String,
         /// OST index (unique per OSS instance)

@@ -18,10 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 thiserror = "1"
 futures = "0.3"
 anyhow = "1"
-rocksdb = "0.24"
 foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"] }
 rand = "0.8"
-chrono = "*"
+chrono = "0.4"
 libc = "0.2"
 nix = { version = "0.28", features = ["fs", "socket"] }
 

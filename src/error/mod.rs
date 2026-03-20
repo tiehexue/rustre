@@ -28,8 +28,7 @@ pub enum RustreError {
     Internal(String),
     #[error("FoundationDB error: {0}")]
     Fdb(String),
-    #[allow(dead_code)]
-    #[error("Zero copy error: {0}")]
+    #[error("zero-copy error: {0}")]
     ZeroCopyError(String),
 }
 
