@@ -91,7 +91,7 @@ async fn register_with_mgs(mgs_addr: &str, listen: &str, ost_index: u32) -> Resu
 
 /// Helper function to perform zero-copy transfer
 async fn zerocopy_send(
-    file: &std::fs::File,
+    file: std::fs::File,
     stream: &TcpStream,
     bytes_to_send: usize,
 ) -> Result<usize> {
@@ -112,7 +112,7 @@ async fn zerocopy_send(
         let socket = stream.as_raw_socket();
 
         tokio::task::spawn_blocking(move || {
-            crate::zerocopy::send_file(file, socket, 0, bytes_to_send)
+            crate::zerocopy::send_file(&file, socket, 0, bytes_to_send)
         })
         .await
         .map_err(|e| RustreError::Internal(format!("spawn_blocking: {e}")))?
@@ -161,7 +161,7 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<FileObjectStore>) -
                     send_msg(&mut stream, &ok_reply).await?;
 
                     // Perform zero-copy transfer
-                    match zerocopy_send(&file, &stream, bytes_to_send).await {
+                    match zerocopy_send(file, &stream, bytes_to_send).await {
                         Ok(sent) => {
                             debug!(
                                 "OSS: zero-copy sent {} bytes for object {}",
