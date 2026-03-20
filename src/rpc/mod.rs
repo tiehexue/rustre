@@ -1,8 +1,8 @@
-//! RPC protocol definitions and networking layer.
+//! Length-prefixed bincode RPC over TCP.
 //!
-//! Networking layer — length-prefixed bincode RPC over TCP.
-//! Analogous to Lustre's PTLRPC + LNet, but simplified for userspace TCP.
-//! Wire format: [4-byte big-endian length][bincode payload]
+//! Wire format: `[4-byte BE length][bincode payload]`
+//!
+//! Analogous to Lustre's PTLRPC + LNet, simplified for userspace TCP.
 
 use crate::error::{Result, RustreError};
 use crate::types::{ClusterConfig, CreateReq, FileMeta, MdsInfo, OstInfo, StatusInfo};
@@ -28,7 +28,7 @@ pub struct RpcMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcKind {
-    // -- MGS RPCs --
+    // -- MGS --
     RegisterMds(MdsInfo),
     RegisterOst(OstInfo),
     GetConfig,
@@ -37,19 +37,19 @@ pub enum RpcKind {
         used_bytes: u64,
     },
 
-    // -- MDS RPCs --
-    Lookup(String),    // path → FileMeta
-    Create(CreateReq), // create file, returns FileMeta with layout
-    Mkdir(String),     // create directory
-    Readdir(String),   // list directory → Vec<FileMeta>
-    Unlink(String),    // remove file
-    Stat(String),      // stat → FileMeta
+    // -- MDS --
+    Lookup(String),
+    Create(CreateReq),
+    Mkdir(String),
+    Readdir(String),
+    Unlink(String),
+    Stat(String),
     SetSize {
         path: String,
         size: u64,
     },
 
-    /// Zero-copy object write request (metadata only, data follows via sendfile)
+    // -- OSS (zero-copy: data follows the RPC header on the wire) --
     ObjWriteZeroCopy {
         object_id: String,
         length: usize,
@@ -61,12 +61,12 @@ pub enum RpcKind {
     ObjDelete {
         object_id: String,
     },
-    /// Delete all objects for an inode (bulk cleanup)
+    /// Bulk-delete all objects for an inode (prefix scan on OST).
     ObjDeleteInode {
         ino: u64,
     },
 
-    // -- Generic replies --
+    // -- Replies --
     Ok,
     Error(String),
     MetaReply(FileMeta),
@@ -75,10 +75,9 @@ pub enum RpcKind {
     ConfigReply(ClusterConfig),
     StatusReply(StatusInfo),
 
-    // -- Status --
+    // -- Status + Heartbeat --
+    // NOTE: variant order is load-bearing — bincode uses ordinals on the wire.
     GetStatus,
-
-    // -- Heartbeat --
     Heartbeat,
     HeartbeatReply,
 }

@@ -113,42 +113,14 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
         let layout = layout.clone();
 
         tokio::spawn(async move {
-            // Try primary OST first
+            // Build address list: primary first, then replicas (for failover)
             let mut addrs_to_try = Vec::new();
-
-            // Add primary address
-            if let Ok(primary_addr) = ost_addr(&config, primary_ost_index) {
-                addrs_to_try.push(primary_addr);
+            if let Ok(addr) = ost_addr(&config, primary_ost_index) {
+                addrs_to_try.push(addr);
             }
-
-            // Add replica addresses if available
-            if layout.replica_count > 1 && !layout.replica_map.is_empty() {
-                // Find which index in ost_indices corresponds to this primary_ost_index
-                let ost_indices = if layout.ost_indices.is_empty() {
-                    // If ost_indices is empty, we're using round-robin
-                    let pos = (primary_ost_index as i64 - layout.stripe_offset as i64)
-                        .rem_euclid(layout.stripe_count as i64)
-                        as usize;
-                    if pos < layout.stripe_count as usize {
-                        Some(pos)
-                    } else {
-                        None
-                    }
-                } else {
-                    layout
-                        .ost_indices
-                        .iter()
-                        .position(|&idx| idx == primary_ost_index)
-                };
-
-                if let Some(pos) = ost_indices {
-                    if pos < layout.replica_map.len() {
-                        for &replica_ost_index in &layout.replica_map[pos] {
-                            if let Ok(addr) = ost_addr(&config, replica_ost_index) {
-                                addrs_to_try.push(addr);
-                            }
-                        }
-                    }
+            for replica_idx in layout.replica_ost_indices(primary_ost_index) {
+                if let Ok(addr) = ost_addr(&config, replica_idx) {
+                    addrs_to_try.push(addr);
                 }
             }
 
@@ -190,21 +162,11 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
 
                 match reply.kind {
                     RpcKind::DataReply(length_bytes) => {
-                        // Parse the length from the reply
-                        if length_bytes.len() != 8 {
+                        let Ok(bytes) = <[u8; 8]>::try_from(length_bytes.as_slice()) else {
                             last_error = Some(RustreError::Net("invalid length reply".into()));
                             continue;
-                        }
-                        let length = usize::from_le_bytes([
-                            length_bytes[0],
-                            length_bytes[1],
-                            length_bytes[2],
-                            length_bytes[3],
-                            length_bytes[4],
-                            length_bytes[5],
-                            length_bytes[6],
-                            length_bytes[7],
-                        ]);
+                        };
+                        let length = usize::from_le_bytes(bytes);
 
                         // Read the data from socket (zero-copy data follows)
                         let mut data = vec![0u8; length];
@@ -400,7 +362,7 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
             );
             println!("  Size:    {} bytes", meta.size);
             println!("  Created: {}", meta.ctime);
-            println!("  Modified:{}", meta.mtime);
+            println!("  Modified: {}", meta.mtime);
             if let Some(layout) = &meta.layout {
                 let total_chunks = layout.total_chunks(meta.size);
                 println!("  Stripe Layout:");
@@ -414,47 +376,18 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
                     let oid = StripeLayout::object_id(meta.ino, seq);
                     let ost = layout.ost_for_chunk(seq);
 
-                    // Get replica information
-                    let replica_info = if layout.replica_count > 1 && !layout.replica_map.is_empty()
-                    {
-                        // Find which index in ost_indices corresponds to this ost
-                        let ost_indices = if layout.ost_indices.is_empty() {
-                            // If ost_indices is empty, we're using round-robin
-                            let pos = (ost as i64 - layout.stripe_offset as i64)
-                                .rem_euclid(layout.stripe_count as i64)
-                                as usize;
-                            if pos < layout.stripe_count as usize {
-                                Some(pos)
-                            } else {
-                                None
-                            }
-                        } else {
-                            layout.ost_indices.iter().position(|&idx| idx == ost)
-                        };
-
-                        if let Some(pos) = ost_indices {
-                            if pos < layout.replica_map.len() {
-                                let replicas = &layout.replica_map[pos];
-                                if !replicas.is_empty() {
-                                    format!(
-                                        " (replicas: {})",
-                                        replicas
-                                            .iter()
-                                            .map(|r| r.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    )
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        }
-                    } else {
+                    let replicas = layout.replica_ost_indices(ost);
+                    let replica_info = if replicas.is_empty() {
                         String::new()
+                    } else {
+                        format!(
+                            " (replicas: {})",
+                            replicas
+                                .iter()
+                                .map(|r| r.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
                     };
 
                     println!(

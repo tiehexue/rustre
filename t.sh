@@ -8,6 +8,7 @@ cleanup() { kill 0 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
 cargo run -- mgs --log-level debug &
+sleep 1
 cargo run -- mds --log-level debug &
 cargo run -- oss -i 0 -l 0.0.0.0:9500 --data-dir /tmp/rustre/oss0 --log-level debug &
 cargo run -- oss -i 1 -l 0.0.0.0:9501 --data-dir /tmp/rustre/oss1 --log-level debug &

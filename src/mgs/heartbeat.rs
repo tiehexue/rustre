@@ -1,14 +1,12 @@
 //! Heartbeat management for MGS
 
-use crate::error::{Result, RustreError};
-use crate::rpc::RpcKind;
+use crate::error::Result;
+use crate::rpc::{rpc_call, RpcKind};
 use crate::storage::FdbMetaStore;
 use crate::types::{MdsInfo, OstInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -39,67 +37,24 @@ pub async fn send_heartbeat(addr: &str) -> bool {
     match result {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            warn!("MGS heartbeat: error from {}: {e}", addr);
+            warn!("MGS heartbeat: error from {addr}: {e}");
             false
         }
         Err(_) => {
-            warn!("MGS heartbeat: timeout from {}", addr);
+            warn!("MGS heartbeat: timeout from {addr}");
             false
         }
     }
 }
 
-/// Implementation of heartbeat send/receive.
+/// Implementation: send Heartbeat RPC, expect HeartbeatReply.
 async fn send_heartbeat_impl(addr: &str) -> Result<()> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| RustreError::Net(format!("connect to {addr}: {e}")))?;
-
-    // Send heartbeat message
-    let msg = crate::rpc::RpcMessage {
-        id: 0, // Heartbeat doesn't need unique ID
-        kind: RpcKind::Heartbeat,
-    };
-    let payload =
-        bincode::serialize(&msg).map_err(|e| RustreError::Serialization(e.to_string()))?;
-    let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| RustreError::Net(e.to_string()))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| RustreError::Net(e.to_string()))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| RustreError::Net(e.to_string()))?;
-
-    // Read reply
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| RustreError::Net(format!("read length: {e}")))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 1024 {
-        return Err(RustreError::Net(format!(
-            "heartbeat reply too large: {len}"
-        )));
-    }
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| RustreError::Net(format!("read payload: {e}")))?;
-
-    let reply: crate::rpc::RpcMessage =
-        bincode::deserialize(&buf).map_err(|e| RustreError::Serialization(e.to_string()))?;
-
+    let reply = rpc_call(addr, RpcKind::Heartbeat).await?;
     match reply.kind {
         RpcKind::HeartbeatReply => Ok(()),
-        _ => Err(RustreError::Net("unexpected heartbeat reply".into())),
+        _ => Err(crate::error::RustreError::Net(
+            "unexpected heartbeat reply".into(),
+        )),
     }
 }
 

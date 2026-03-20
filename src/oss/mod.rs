@@ -1,12 +1,9 @@
-//! Object Storage Server (OSS) / Object Storage Target (OST)
+//! Object Storage Server (OSS) / Object Storage Target (OST).
 //!
-//! The OSS stores actual file data as objects in files on disk. Each file is striped
-//! across multiple OSTs (RAID-0 style). The OSS:
-//! - Registers its OST with the MGS on startup
-//! - Handles ObjWrite / ObjRead / ObjDelete / ObjDeleteInode RPCs from clients
-//! - Handles zero-copy operations: ObjWriteZeroCopy / ObjReadZeroCopy
-//! - Periodically reports disk usage back to the MGS
-//! - Persists objects as files via FileObjectStore (enables zero-copy)
+//! Stores file data as objects on local disk. Each file is RAID-0 striped across
+//! multiple OSTs. Supports zero-copy reads (sendfile from file to socket) and
+//! zero-copy writes (recv from socket, write to file). Periodically reports
+//! disk usage back to the MGS.
 
 use crate::error::{Result, RustreError};
 use crate::rpc::{make_reply, recv_msg, rpc_call, send_msg, RpcKind};
@@ -89,7 +86,7 @@ async fn register_with_mgs(mgs_addr: &str, listen: &str, ost_index: u32) -> Resu
     }
 }
 
-/// Helper function to perform zero-copy transfer
+/// Perform a zero-copy sendfile from `file` to the TCP socket.
 async fn zerocopy_send(
     file: std::fs::File,
     stream: &TcpStream,
@@ -123,7 +120,7 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<FileObjectStore>) -
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
         RpcKind::ObjWriteZeroCopy { object_id, length } => {
-            // Read the data that was sent via sendfile after the RPC message
+            // Data follows the RPC header (sent via sendfile on the client side)
             let mut data = vec![0u8; length];
             if let Err(e) = stream.read_exact(&mut data).await {
                 // Failed to read data, send error reply
@@ -143,10 +140,8 @@ async fn handle_connection(mut stream: TcpStream, store: Arc<FileObjectStore>) -
             }
         }
         RpcKind::ObjReadZeroCopy { object_id, length } => {
-            // Zero-copy read - open file and send via sendfile
             match store.open_for_zerocopy(&object_id) {
                 Ok((file, file_len)) => {
-                    // Determine how many bytes to send (use file length if length is 0 or larger than file)
                     let bytes_to_send = if length == 0 || length > file_len as usize {
                         file_len as usize
                     } else {

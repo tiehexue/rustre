@@ -46,7 +46,7 @@ impl FdbMetaStore {
             bincode::serialize(value).map_err(|e| RustreError::Serialization(e.to_string()))?;
 
         self.db
-            .run(|trx, _maybe_committed| {
+            .run(|trx, _| {
                 let key = key.clone();
                 let data = data.clone();
                 async move {
@@ -65,7 +65,7 @@ impl FdbMetaStore {
 
         let result = self
             .db
-            .run(|trx, _maybe_committed| {
+            .run(|trx, _| {
                 let key = key.clone();
                 async move { Ok(trx.get(&key, false).await?) }
             })
@@ -87,7 +87,7 @@ impl FdbMetaStore {
         let key = self.key(suffix);
 
         self.db
-            .run(|trx, _maybe_committed| {
+            .run(|trx, _| {
                 let key = key.clone();
                 async move {
                     trx.clear(&key);
@@ -108,7 +108,7 @@ impl FdbMetaStore {
 
         let result = self
             .db
-            .run(|trx, _maybe_committed| {
+            .run(|trx, _| {
                 let begin = begin.clone();
                 let end = end.clone();
                 async move {

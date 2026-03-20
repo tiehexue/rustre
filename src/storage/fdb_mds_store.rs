@@ -61,8 +61,7 @@ impl FdbMdsStore {
     fn children_prefix(&self, parent_ino: u64) -> (Vec<u8>, Vec<u8>) {
         let begin = format!("{}children/{:016x}/", self.prefix, parent_ino).into_bytes();
         let mut end = begin.clone();
-        // Increment last byte of prefix to form exclusive upper bound
-        // '/' (0x2F) + 1 = '0' (0x30), so range covers all children keys
+        // Increment last byte to form an exclusive upper bound for range scan
         if let Some(last) = end.last_mut() {
             *last += 1;
         }

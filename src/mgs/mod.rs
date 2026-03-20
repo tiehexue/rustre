@@ -1,4 +1,4 @@
-//! Management Server (MGS) — now backed by FoundationDB for stateless HA.
+//! Management Server (MGS) — stateless, FoundationDB-backed.
 //!
 //! The MGS is the cluster's configuration authority. It:
 //! - Accepts registrations from MDS and OSS nodes
