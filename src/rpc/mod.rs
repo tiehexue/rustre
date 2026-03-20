@@ -5,9 +5,7 @@
 //! Wire format: [4-byte big-endian length][bincode payload]
 
 use crate::error::{Result, RustreError};
-use crate::types::{
-    ClusterConfig, CreateReq, FileMeta, MdsInfo, ObjReadReq, ObjWriteReq, OstInfo, StatusInfo,
-};
+use crate::types::{ClusterConfig, CreateReq, FileMeta, MdsInfo, OstInfo, StatusInfo};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,11 +50,12 @@ pub enum RpcKind {
         size: u64,
     },
 
-    // -- OSS RPCs --
-    ObjWrite(ObjWriteReq),
-    ObjRead(ObjReadReq),
     /// Zero-copy object write request (metadata only, data follows via sendfile)
     ObjWriteZeroCopy {
+        object_id: String,
+        length: usize,
+    },
+    ObjReadZeroCopy {
         object_id: String,
         length: usize,
     },

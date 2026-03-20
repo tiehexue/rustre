@@ -3,10 +3,12 @@
 use crate::client::commands::ClientCommands;
 use crate::client::put::cmd_put;
 use crate::error::{Result, RustreError};
-use crate::rpc::{rpc_call, RpcKind};
-use crate::types::{ClusterConfig, ObjReadReq, StripeLayout};
+use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, RpcMessage, MSG_COUNTER};
+use crate::types::{ClusterConfig, StripeLayout};
 use futures::future::join_all;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use std::sync::atomic::Ordering;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::{debug, error};
 
 /// Fetch cluster config from MGS.
@@ -91,7 +93,7 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     let file_size = meta.size as usize;
     let chunk_size = layout.stripe_size as usize;
     println!(
-        "GET: {source} → {dest} ({} bytes, {} stripes, streaming)",
+        "GET: {source} → {dest} ({} bytes, {} stripes, zero-copy)",
         file_size, layout.stripe_count
     );
 
@@ -154,35 +156,76 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
 
             // Try each address in order (primary first, then replicas)
             for addr in addrs_to_try {
-                let result = rpc_call(
-                    &addr,
-                    RpcKind::ObjRead(ObjReadReq {
+                // Connect to OSS for zero-copy read
+                let mut stream = match TcpStream::connect(&addr).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        last_error = Some(RustreError::Net(format!("connect to {addr}: {e}")));
+                        continue;
+                    }
+                };
+
+                // Send zero-copy read request
+                let request_msg = RpcMessage {
+                    id: MSG_COUNTER.fetch_add(1, Ordering::Relaxed),
+                    kind: RpcKind::ObjReadZeroCopy {
                         object_id: object_id.clone(),
-                    }),
-                )
-                .await;
-                match result {
-                    Ok(reply) => match reply.kind {
-                        RpcKind::DataReply(data) => {
-                            // Success! Send the data and return
-                            if tx.send((chunk_index as usize, Ok(data))).await.is_err() {
-                                error!("Writer task dropped while sending chunk {chunk_index}");
-                            }
-                            return;
-                        }
-                        RpcKind::Error(e) => {
-                            last_error = Some(RustreError::Net(e));
-                            // Continue to next replica
-                            debug!("trying next replica!");
-                            continue;
-                        }
-                        _ => {
-                            last_error = Some(RustreError::Net("unexpected OSS reply".into()));
-                            continue;
-                        }
+                        length: 0, // 0 means read entire file
                     },
+                };
+
+                if let Err(e) = send_msg(&mut stream, &request_msg).await {
+                    last_error = Some(e);
+                    continue;
+                }
+
+                // Receive reply with length
+                let reply = match recv_msg(&mut stream).await {
+                    Ok(reply) => reply,
                     Err(e) => {
                         last_error = Some(e);
+                        continue;
+                    }
+                };
+
+                match reply.kind {
+                    RpcKind::DataReply(length_bytes) => {
+                        // Parse the length from the reply
+                        if length_bytes.len() != 8 {
+                            last_error = Some(RustreError::Net("invalid length reply".into()));
+                            continue;
+                        }
+                        let length = usize::from_le_bytes([
+                            length_bytes[0],
+                            length_bytes[1],
+                            length_bytes[2],
+                            length_bytes[3],
+                            length_bytes[4],
+                            length_bytes[5],
+                            length_bytes[6],
+                            length_bytes[7],
+                        ]);
+
+                        // Read the data from socket (zero-copy data follows)
+                        let mut data = vec![0u8; length];
+                        if let Err(e) = stream.read_exact(&mut data).await {
+                            last_error = Some(RustreError::Net(format!("read data: {e}")));
+                            continue;
+                        }
+                        // Success! Send the data and return
+                        if tx.send((chunk_index as usize, Ok(data))).await.is_err() {
+                            error!("Writer task dropped while sending chunk {chunk_index}");
+                        }
+                        return;
+                    }
+                    RpcKind::Error(e) => {
+                        last_error = Some(RustreError::Net(e));
+                        // Continue to next replica
+                        debug!("trying next replica!");
+                        continue;
+                    }
+                    _ => {
+                        last_error = Some(RustreError::Net("unexpected OSS reply".into()));
                         continue;
                     }
                 }
@@ -273,7 +316,7 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
         ))
     })?;
 
-    println!("Successfully read {file_size} bytes from {source} to {dest} (streaming)");
+    println!("Successfully read {file_size} bytes from {source} to {dest} (zero-copy)");
     Ok(())
 }
 
