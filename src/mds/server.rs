@@ -72,6 +72,10 @@ async fn handle_connection(
         RpcKind::SetSize { path, size } => {
             operations::handle_set_size(msg.id, &path, size, &state).await
         }
+        RpcKind::CommitCreate { ino, size } => {
+            operations::handle_commit_create(msg.id, ino, size, &state).await
+        }
+        RpcKind::AbortCreate { ino } => operations::handle_abort_create(msg.id, ino, &state).await,
         RpcKind::Heartbeat => {
             // Respond to heartbeat immediately
             Ok(make_reply(msg.id, RpcKind::HeartbeatReply))

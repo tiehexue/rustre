@@ -6,7 +6,7 @@ use crate::rpc::{rpc_call, RpcKind};
 use crate::types::CreateReq;
 use futures::future::join_all;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// PUT command implementation
 pub async fn cmd_put(
@@ -71,7 +71,8 @@ async fn put_file(
     let config = get_config(mgs_addr).await?;
     let mds = mds_addr(&config)?;
 
-    // Create file on MDS (gets stripe layout back)
+    // ── Phase 1: Create pending file on MDS ──
+    // The file is created with pending=true, invisible to other clients.
     let reply = rpc_call(
         &mds,
         RpcKind::Create(CreateReq {
@@ -95,7 +96,7 @@ async fn put_file(
         .ok_or_else(|| RustreError::Internal("no stripe layout returned".into()))?;
 
     println!(
-        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={}, replica_count={})",
+        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={}, replica_count={}, pending)",
         meta.ino,
         layout.stripe_count,
         layout.stripe_size,
@@ -103,7 +104,8 @@ async fn put_file(
         layout.replica_count
     );
 
-    // Create one task per stripe — each task uses zero-copy transfer
+    // ── Phase 2: Write data to OSS ──
+    // One task per stripe, all run in parallel.
     let mut write_futures = Vec::new();
     for ost_assignment in 0..layout.stripe_count {
         let source_path = source.to_string();
@@ -125,35 +127,87 @@ async fn put_file(
 
     // Wait for all writes to complete
     let results = join_all(write_futures).await;
+    let mut write_error: Option<RustreError> = None;
     for (i, res) in results.into_iter().enumerate() {
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 error!("OST writer task {i} failed: {e}");
-                return Err(e);
+                if write_error.is_none() {
+                    write_error = Some(e);
+                }
             }
             Err(e) => {
                 error!("OST writer task {i} panicked: {e}");
-                return Err(RustreError::Internal(format!("write task panicked: {e}")));
+                if write_error.is_none() {
+                    write_error = Some(RustreError::Internal(format!("write task panicked: {e}")));
+                }
             }
         }
     }
 
-    // Update file size on MDS
-    let _ = rpc_call(
+    // ── Phase 2 failed: abort and clean up ──
+    if let Some(err) = write_error {
+        warn!("PUT: write failed for {dest}, aborting pending file and cleaning up OSS objects");
+
+        // Best-effort: tell MDS to remove the pending record
+        if let Err(e) = rpc_call(&mds, RpcKind::AbortCreate { ino: meta.ino }).await {
+            warn!("PUT: failed to abort pending MDS record for {dest}: {e}");
+        }
+
+        // Best-effort: delete any objects that were already written to OSTs
+        cleanup_oss_objects(&config, meta.ino).await;
+
+        return Err(err);
+    }
+
+    // ── Phase 3: Commit — set size and make file visible ──
+    let commit_reply = rpc_call(
         &mds,
-        RpcKind::SetSize {
-            path: dest.to_string(),
+        RpcKind::CommitCreate {
+            ino: meta.ino,
             size: file_size,
         },
     )
     .await?;
+
+    match commit_reply.kind {
+        RpcKind::Ok => {}
+        RpcKind::Error(e) => {
+            // Commit failed after all data was written — this is the worst case.
+            // The data exists on OSS but the file remains pending (invisible).
+            // A retry of CommitCreate could recover this, or the pending GC will clean it up.
+            error!("PUT: commit failed for {dest}: {e}");
+            return Err(RustreError::Net(format!("commit failed: {e}")));
+        }
+        _ => {
+            return Err(RustreError::Net("unexpected reply from MDS".into()));
+        }
+    }
 
     println!(
         "Successfully wrote {file_size} bytes to {dest} across {} OSTs",
         layout.stripe_count
     );
     Ok(())
+}
+
+/// Best-effort cleanup: delete all objects for the given inode from all OSTs.
+/// Errors are logged but not propagated — this is crash-recovery territory.
+async fn cleanup_oss_objects(config: &crate::types::ClusterConfig, ino: u64) {
+    let mut delete_futures = Vec::new();
+    for ost_info in &config.ost_list {
+        let addr = ost_info.address.clone();
+        delete_futures.push(tokio::spawn(async move {
+            match rpc_call(&addr, RpcKind::ObjDeleteInode { ino }).await {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("cleanup: failed to delete objects for ino={ino:016x} from {addr}: {e}");
+                }
+            }
+        }));
+    }
+    join_all(delete_futures).await;
 }
 
 async fn put_directory(

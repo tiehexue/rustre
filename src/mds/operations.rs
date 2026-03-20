@@ -52,7 +52,8 @@ pub async fn register_with_mgs(mgs_addr: &str, listen: &str) -> Result<()> {
     }
 }
 
-/// Handle lookup operation
+/// Handle lookup operation.
+/// Pending files (write-intent not yet committed) are invisible to lookups.
 pub async fn handle_lookup(
     req_id: u64,
     path: &str,
@@ -72,6 +73,11 @@ pub async fn handle_lookup(
         .get_inode(ino)
         .await?
         .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    // Pending files are not visible to external lookups/stat
+    if meta.pending {
+        return Err(RustreError::NotFound(path));
+    }
 
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
@@ -212,13 +218,16 @@ pub async fn handle_create(
         mtime: now,
         layout: Some(layout.clone()),
         parent_ino,
+        // Mark as pending — invisible to lookups until CommitCreate.
+        // This prevents readers from seeing a file whose data is still being written.
+        pending: true,
     };
 
     // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
     st.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!(
-        "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={}",
+        "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={} (pending)",
         layout.stripe_count, layout.stripe_size, layout.stripe_offset
     );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
@@ -258,6 +267,7 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> 
         mtime: now,
         layout: None,
         parent_ino,
+        pending: false,
     };
 
     // Persist atomically: inode + path + child entry + next_ino
@@ -298,7 +308,10 @@ pub async fn handle_readdir(
     let mut entries = Vec::new();
     for child_ino in child_inos {
         if let Some(child_meta) = st.store.get_inode(child_ino).await? {
-            entries.push(child_meta);
+            // Skip pending files — they're not visible until committed
+            if !child_meta.pending {
+                entries.push(child_meta);
+            }
         }
     }
 
@@ -374,5 +387,72 @@ pub async fn handle_set_size(
     meta.mtime = FileMeta::now_secs();
     st.store.set_inode(ino, &meta).await?;
 
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Commit a pending file: set final size, clear pending flag, make it visible.
+///
+/// This is the second phase of the two-phase create protocol.
+/// Uses ino directly — no redundant path resolution.
+/// Idempotent: if already committed, returns Ok silently.
+pub async fn handle_commit_create(
+    req_id: u64,
+    ino: u64,
+    size: u64,
+    state: &RwLock<MdsState>,
+) -> Result<RpcMessage> {
+    let st = state.read().await;
+
+    let mut meta = st
+        .store
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("ino {ino}")))?;
+
+    if !meta.pending {
+        // Already committed (idempotent — a retry after network timeout is fine)
+        return Ok(make_reply(req_id, RpcKind::Ok));
+    }
+
+    meta.size = size;
+    meta.mtime = FileMeta::now_secs();
+    meta.pending = false;
+    st.store.set_inode(ino, &meta).await?;
+
+    info!("MDS: committed file {} ino={ino} size={size}", meta.path);
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Abort a pending file: atomically remove the MDS record.
+///
+/// Called by the client when OSS writes fail, to clean up the pending metadata.
+/// Uses ino directly — no redundant path resolution.
+/// Only removes if the file is still pending (prevents aborting a committed file).
+/// Idempotent: if already gone, returns Ok silently.
+pub async fn handle_abort_create(
+    req_id: u64,
+    ino: u64,
+    state: &RwLock<MdsState>,
+) -> Result<RpcMessage> {
+    let st = state.read().await;
+
+    let meta = match st.store.get_inode(ino).await? {
+        Some(m) => m,
+        None => {
+            // Already gone — idempotent
+            return Ok(make_reply(req_id, RpcKind::Ok));
+        }
+    };
+
+    // Only remove if still pending — a committed file must never be aborted
+    if !meta.pending {
+        return Ok(make_reply(req_id, RpcKind::Ok));
+    }
+
+    st.store
+        .txn_unlink(ino, &meta.path, meta.parent_ino, false)
+        .await?;
+
+    info!("MDS: aborted pending file {} ino={ino}", meta.path);
     Ok(make_reply(req_id, RpcKind::Ok))
 }
