@@ -95,6 +95,25 @@ pub enum RpcKind {
     AbortCreate {
         ino: u64,
     },
+
+    // -- Inode range allocator --
+    /// MDS requests a batch of inode numbers from MGS to avoid per-file FDB contention.
+    /// The only inode-range operation — no return/reclaim protocol needed.
+    /// u64 inode space (~1.8×10¹⁹) is effectively infinite; leaked ranges are harmless.
+    AllocInodeRange {
+        count: u64,
+    },
+    /// MGS reply: the allocated inode range [start, end) — `end` is exclusive.
+    InodeRangeReply {
+        start: u64,
+        end: u64,
+    },
+    /// Kept for wire compatibility (bincode ordinals). No longer used.
+    #[doc(hidden)]
+    ReturnInodeRange {
+        start: u64,
+        end: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

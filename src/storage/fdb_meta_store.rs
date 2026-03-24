@@ -8,6 +8,7 @@ use crate::error::{Result, RustreError};
 ///   {cluster}/mds/{address}           → MdsInfo (bincode)
 ///   {cluster}/ost/{ost_index:08x}     → OstInfo (bincode)
 ///   {cluster}/ost_usage/{index:08x}   → u64 used_bytes (bincode)
+///   {cluster}/next_ino_range          → u64 (8 bytes LE, global inode counter)
 pub struct FdbMetaStore {
     db: foundationdb::Database,
     prefix: String,
@@ -132,5 +133,51 @@ impl FdbMetaStore {
             items.push(value);
         }
         Ok(items)
+    }
+
+    // -----------------------------------------------------------------------
+    // Inode range allocator (centralized in MGS)
+    // -----------------------------------------------------------------------
+
+    fn next_ino_range_key(&self) -> Vec<u8> {
+        format!("{}next_ino_range", self.prefix).into_bytes()
+    }
+
+    /// Atomically allocate a range of `count` inode numbers.
+    /// Returns `(start, end)` where the range is `[start, end)`.
+    ///
+    /// This is the global inode counter managed by MGS. MDS instances
+    /// request ranges in bulk to avoid per-file FDB contention.
+    ///
+    /// The counter only ever advances — no reclaim protocol.
+    /// u64 inode space (~1.8×10¹⁹) is effectively infinite.
+    pub async fn alloc_inode_range(&self, count: u64) -> Result<(u64, u64)> {
+        let key = self.next_ino_range_key();
+
+        let (start, end) = self
+            .db
+            .run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    let current = trx.get(&key, false).await?;
+                    let start = match current {
+                        Some(slice) => {
+                            let bytes: [u8; 8] = slice
+                                .as_ref()
+                                .try_into()
+                                .unwrap_or([2, 0, 0, 0, 0, 0, 0, 0]);
+                            u64::from_le_bytes(bytes)
+                        }
+                        None => 2, // Start from 2 (ino 1 = root)
+                    };
+                    let end = start + count;
+                    trx.set(&key, &end.to_le_bytes());
+                    Ok((start, end))
+                }
+            })
+            .await
+            .map_err(|e| RustreError::Fdb(format!("FDB alloc_inode_range: {e}")))?;
+
+        Ok((start, end))
     }
 }

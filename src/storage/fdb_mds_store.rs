@@ -13,13 +13,15 @@ use tracing::debug;
 ///   `ino/{ino:016x}`                          → FileMeta (bincode)
 ///   `path/{normalized_path}`                   → u64 ino (bincode, 8 bytes LE)
 ///   `children/{parent_ino:016x}/{child_ino:016x}` → empty (existence = membership)
-///   `next_ino`                                 → u64 (8 bytes LE, atomic add)
+///
+/// Note: Inode allocation is now handled by the MGS inode range allocator.
+/// MDS instances request inode ranges in bulk from MGS and allocate locally
+/// with zero FDB contention.
 ///
 /// Design rationale:
 /// - **Children as individual keys**: avoids read-modify-write on hot directories;
 ///   adding/removing a child is a single set/clear, listing is a range scan.
-/// - **next_ino via FDB atomic add**: safe concurrent inode allocation across
-///   multiple MDS instances.
+/// - **Inode ranges from MGS**: eliminates the `next_ino` FDB hotspot.
 /// - **Transactional creates/unlinks**: inode + path + children updated atomically.
 pub struct FdbMdsStore {
     db: foundationdb::Database,
@@ -66,10 +68,6 @@ impl FdbMdsStore {
             *last += 1;
         }
         (begin, end)
-    }
-
-    fn next_ino_key(&self) -> Vec<u8> {
-        format!("{}next_ino", self.prefix).into_bytes()
     }
 
     // -----------------------------------------------------------------------
@@ -201,49 +199,10 @@ impl FdbMdsStore {
     }
 
     // -----------------------------------------------------------------------
-    // Inode counter (atomic allocation across multiple MDS instances)
-    // -----------------------------------------------------------------------
-
-    /// Allocate the next inode number atomically.
-    /// Uses FDB's atomic add to guarantee uniqueness even with concurrent MDS instances.
-    pub async fn alloc_ino(&self) -> Result<u64> {
-        let key = self.next_ino_key();
-
-        let ino = self
-            .db
-            .run(|trx, _| {
-                let key = key.clone();
-                async move {
-                    // Read current value
-                    let current = trx.get(&key, false).await?;
-                    let ino = match current {
-                        Some(slice) => {
-                            let bytes: [u8; 8] = slice
-                                .as_ref()
-                                .try_into()
-                                .unwrap_or([2, 0, 0, 0, 0, 0, 0, 0]); // default to 2
-                            u64::from_le_bytes(bytes)
-                        }
-                        None => 2, // Start from 2 (1 = root)
-                    };
-                    // Write back ino+1
-                    let next = (ino + 1).to_le_bytes();
-                    trx.set(&key, &next);
-                    Ok(ino)
-                }
-            })
-            .await
-            .map_err(|e| RustreError::Fdb(format!("FDB alloc ino: {e}")))?;
-
-        Ok(ino)
-    }
-
-    // -----------------------------------------------------------------------
     // Transactional compound operations
     // -----------------------------------------------------------------------
 
     /// Atomically create a file/directory: set inode, path, add to parent's children.
-    /// Returns the allocated inode number.
     pub async fn txn_create(
         &self,
         meta: &crate::types::FileMeta,
@@ -253,8 +212,6 @@ impl FdbMdsStore {
         let ino_key = self.ino_key(meta.ino);
         let path_key = self.path_key(path);
         let child_key = self.child_key(parent_ino, meta.ino);
-        let next_ino_key = self.next_ino_key();
-        let next_val = (meta.ino + 1).to_le_bytes().to_vec();
 
         let meta_data =
             bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
@@ -265,15 +222,12 @@ impl FdbMdsStore {
                 let ino_key = ino_key.clone();
                 let path_key = path_key.clone();
                 let child_key = child_key.clone();
-                let next_ino_key = next_ino_key.clone();
-                let next_val = next_val.clone();
                 let meta_data = meta_data.clone();
                 let ino_data = ino_data.clone();
                 async move {
                     trx.set(&ino_key, &meta_data);
                     trx.set(&path_key, &ino_data);
                     trx.set(&child_key, &[]); // add child to parent
-                    trx.set(&next_ino_key, &next_val); // advance inode counter
                     Ok(())
                 }
             })
@@ -326,6 +280,7 @@ impl FdbMdsStore {
     }
 
     /// Initialize the root directory (ino=1) if it doesn't already exist.
+    /// Note: Does NOT initialize the inode counter — that is managed by MGS.
     pub async fn ensure_root(&self) -> Result<()> {
         let root_ino: u64 = 1;
 
@@ -347,31 +302,26 @@ impl FdbMdsStore {
             pending: false,
         };
 
-        // Atomically set root inode + path + next_ino in one transaction
+        // Atomically set root inode + path in one transaction
         let ino_key = self.ino_key(root_ino);
         let path_key = self.path_key("/");
-        let next_ino_key = self.next_ino_key();
 
         let meta_data =
             bincode::serialize(&root).map_err(|e| RustreError::Serialization(e.to_string()))?;
         let ino_data = root_ino.to_le_bytes().to_vec();
-        let next_val = 2u64.to_le_bytes().to_vec();
 
         self.db
             .run(|trx, _| {
                 let ino_key = ino_key.clone();
                 let path_key = path_key.clone();
-                let next_ino_key = next_ino_key.clone();
                 let meta_data = meta_data.clone();
                 let ino_data = ino_data.clone();
-                let next_val = next_val.clone();
                 async move {
                     // Only initialize if not already present (idempotent)
                     let existing = trx.get(&ino_key, false).await?;
                     if existing.is_none() {
                         trx.set(&ino_key, &meta_data);
                         trx.set(&path_key, &ino_data);
-                        trx.set(&next_ino_key, &next_val);
                     }
                     Ok(())
                 }

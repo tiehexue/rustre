@@ -19,10 +19,15 @@ pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()>
     // Fetch cluster config from MGS
     let config = operations::fetch_config(mgs_addr).await?;
 
+    // Request initial inode range from MGS
+    let (ino_start, ino_end) = operations::alloc_initial_inode_range(mgs_addr).await?;
+    let ino_alloc = operations::InodeAllocator::new(ino_start, ino_end, mgs_addr.to_string());
+
     let state = Arc::new(RwLock::new(operations::MdsState {
         store,
         cluster_config: config,
         mgs_addr: mgs_addr.to_string(),
+        ino_alloc,
     }));
 
     // Register with MGS
@@ -44,7 +49,7 @@ pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()>
     }
 
     let listener = TcpListener::bind(listen).await?;
-    info!("MDS listening on {listen} (stateless, backed by FoundationDB cluster={cluster_name})");
+    info!("MDS listening on {listen} (stateless, backed by FoundationDB cluster={cluster_name}, inode range [{ino_start}, {ino_end}))");
 
     loop {
         let (stream, addr) = listener.accept().await?;
