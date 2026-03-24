@@ -12,9 +12,9 @@ use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 /// Heartbeat timeout in seconds
-const HEARTBEAT_TIMEOUT_SECS: u64 = 1;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 5;
 /// Maximum consecutive heartbeat failures before removing a node
-const MAX_HEARTBEAT_FAILURES: u32 = 2;
+const MAX_HEARTBEAT_FAILURES: u32 = 3;
 
 /// Tracks heartbeat failure counts for registered nodes
 #[derive(Debug, Default)]
