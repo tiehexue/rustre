@@ -7,6 +7,7 @@ use crate::error::{Result, RustreError};
 use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, RpcMessage, MSG_COUNTER};
 use crate::types::{ClusterConfig, StripeLayout};
 use crate::utils::timer::CommandTimer;
+use rand::Rng;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,13 +23,13 @@ pub async fn get_config(mgs_addr: &str) -> Result<ClusterConfig> {
     }
 }
 
-/// Resolve MDS address from config (pick first MDS).
+/// Resolve MDS address from config (random pick).
 pub fn mds_addr(config: &ClusterConfig) -> Result<String> {
-    config
-        .mds_list
-        .first()
-        .map(|m| m.address.clone())
-        .ok_or_else(|| RustreError::Net("no MDS registered in cluster".into()))
+    if config.mds_list.is_empty() {
+        return Err(RustreError::Net("no MDS registered in cluster".into()));
+    }
+    let idx = rand::thread_rng().gen_range(0..config.mds_list.len());
+    Ok(config.mds_list[idx].address.clone())
 }
 
 /// Look up an OST address by index.
