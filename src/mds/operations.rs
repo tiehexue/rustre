@@ -7,14 +7,125 @@ use crate::storage::FdbMdsStore;
 use crate::types::{ClusterConfig, CreateReq, FileMeta, StripeLayout, DEFAULT_STRIPE_SIZE};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
+
+/// Default number of inodes to request per batch from MGS.
+const INODE_RANGE_BATCH: u64 = 10_000;
+
+/// Lock-free local inode allocator.
+///
+/// Each MDS instance holds a range `[next, end)` obtained from MGS.
+/// Allocation is a single atomic fetch_add — zero contention, zero FDB traffic.
+/// When the range is exhausted, we request a new batch from MGS.
+///
+/// No return/reclaim protocol: u64 inode space (~1.8×10¹⁹) is effectively
+/// infinite. Leaked ranges from crashes or shutdowns are harmless.
+pub struct InodeAllocator {
+    /// Next inode to allocate (atomic for lock-free fast path).
+    next: AtomicU64,
+    /// Exclusive upper bound of current range.
+    end: AtomicU64,
+    /// Serialize range refill requests (only one refill at a time).
+    refill_lock: Mutex<()>,
+    /// MGS address for requesting new ranges.
+    mgs_addr: String,
+}
+
+impl InodeAllocator {
+    /// Create allocator with an initial range obtained from MGS.
+    pub fn new(start: u64, end: u64, mgs_addr: String) -> Self {
+        Self {
+            next: AtomicU64::new(start),
+            end: AtomicU64::new(end),
+            refill_lock: Mutex::new(()),
+            mgs_addr,
+        }
+    }
+
+    /// Allocate a single inode number.
+    ///
+    /// Fast path: atomic increment, no I/O.
+    /// Slow path (range exhausted): RPC to MGS for a new batch.
+    pub async fn alloc(&self) -> Result<u64> {
+        // Fast path: try to claim one from current range
+        let ino = self.next.fetch_add(1, Ordering::Relaxed);
+        if ino < self.end.load(Ordering::Relaxed) {
+            return Ok(ino);
+        }
+
+        // Slow path: range exhausted, need to refill
+        // Undo the speculative increment so other threads also hit the slow path
+        self.next.fetch_sub(1, Ordering::Relaxed);
+
+        // Serialize refill requests
+        let _guard = self.refill_lock.lock().await;
+
+        // Double-check: another thread may have refilled while we waited
+        let ino = self.next.fetch_add(1, Ordering::Relaxed);
+        if ino < self.end.load(Ordering::Relaxed) {
+            return Ok(ino);
+        }
+        self.next.fetch_sub(1, Ordering::Relaxed);
+
+        // Request new range from MGS
+        let reply = rpc_call(
+            &self.mgs_addr,
+            RpcKind::AllocInodeRange {
+                count: INODE_RANGE_BATCH,
+            },
+        )
+        .await?;
+
+        match reply.kind {
+            RpcKind::InodeRangeReply { start, end } => {
+                info!(
+                    "MDS: refilled inode range [{start}, {end}) ({} inodes)",
+                    end - start
+                );
+                self.next.store(start + 1, Ordering::Relaxed);
+                self.end.store(end, Ordering::Relaxed);
+                Ok(start)
+            }
+            RpcKind::Error(e) => Err(RustreError::Net(format!("alloc inode range: {e}"))),
+            _ => Err(RustreError::Net(
+                "unexpected reply for AllocInodeRange".into(),
+            )),
+        }
+    }
+}
+
+/// Request an initial inode range from MGS.
+pub async fn alloc_initial_inode_range(mgs_addr: &str) -> Result<(u64, u64)> {
+    let reply = rpc_call(
+        mgs_addr,
+        RpcKind::AllocInodeRange {
+            count: INODE_RANGE_BATCH,
+        },
+    )
+    .await?;
+    match reply.kind {
+        RpcKind::InodeRangeReply { start, end } => {
+            info!(
+                "MDS: initial inode range [{start}, {end}) ({} inodes)",
+                end - start
+            );
+            Ok((start, end))
+        }
+        RpcKind::Error(e) => Err(RustreError::Net(format!("alloc inode range: {e}"))),
+        _ => Err(RustreError::Net(
+            "unexpected reply for AllocInodeRange".into(),
+        )),
+    }
+}
 
 /// MDS runtime state
 pub struct MdsState {
     pub store: FdbMdsStore,
     pub cluster_config: ClusterConfig,
     pub mgs_addr: String,
+    pub ino_alloc: InodeAllocator,
 }
 
 /// Fetch cluster config from MGS
@@ -155,8 +266,8 @@ pub async fn handle_create(
         req.stripe_size
     };
 
-    // Allocate inode atomically from FDB
-    let ino = st.store.alloc_ino().await?;
+    // Allocate inode from local range (zero FDB contention)
+    let ino = st.ino_alloc.alloc().await?;
 
     // Stripe offset: spread files across available OSTs for even distribution
     // This is an index into the available_osts vector, not the absolute OST index
@@ -253,8 +364,8 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> 
         return Err(RustreError::AlreadyExists(path));
     }
 
-    // Allocate inode atomically from FDB
-    let ino = st.store.alloc_ino().await?;
+    // Allocate inode from local range (zero FDB contention)
+    let ino = st.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
     let meta = FileMeta {

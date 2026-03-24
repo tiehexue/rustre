@@ -111,6 +111,24 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<MgsState>) -> Resul
             Err(e) => make_reply(msg.id, RpcKind::Error(format!("status read failed: {e}"))),
         },
 
+        RpcKind::AllocInodeRange { count } => match state.store.alloc_inode_range(count).await {
+            Ok((start, end)) => {
+                info!("MGS: allocated inode range [{start}, {end}) ({count} inodes)");
+                make_reply(msg.id, RpcKind::InodeRangeReply { start, end })
+            }
+            Err(e) => {
+                error!("MGS: failed to allocate inode range: {e}");
+                make_reply(msg.id, RpcKind::Error(format!("alloc inode range: {e}")))
+            }
+        },
+
+        // ReturnInodeRange is deprecated — inode space is effectively infinite,
+        // no reclaim needed. Accept silently for wire compatibility.
+        RpcKind::ReturnInodeRange { start, end } => {
+            info!("MGS: ignoring returned inode range [{start}, {end}) (deprecated, no reclaim)");
+            make_reply(msg.id, RpcKind::Ok)
+        }
+
         other => {
             warn!("MGS: unexpected RPC: {other:?}");
             make_reply(
