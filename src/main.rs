@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
 
+    /// MGS address to register with, ignored in mgs instance
+    #[arg(short, long, global = true, default_value = "127.0.0.1:9400")]
+    mgs: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -52,9 +56,6 @@ enum Commands {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9401")]
         listen: String,
-        /// MGS address to register with
-        #[arg(short, long, default_value = "127.0.0.1:9400")]
-        mgs: String,
         /// Cluster name (used as FoundationDB key prefix, must match MGS)
         #[arg(short, long, default_value = "rustre")]
         cluster_name: String,
@@ -64,9 +65,6 @@ enum Commands {
         /// Listen address
         #[arg(short, long, default_value = "0.0.0.0:9402")]
         listen: String,
-        /// MGS address to register with
-        #[arg(short, long, default_value = "127.0.0.1:9400")]
-        mgs: String,
         /// Data directory for object storage
         #[arg(short, long, default_value = "/tmp/rustre/oss")]
         data_dir: String,
@@ -93,6 +91,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging based on the command and log level
     utils::logging::init_logging(&cli.command, &cli.log_level)?;
 
+    let mgs = &cli.mgs;
+
     match cli.command {
         Commands::Mgs {
             listen,
@@ -105,23 +105,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Mds {
             listen,
-            mgs,
             cluster_name,
         } => {
             // MDS also uses FoundationDB — boot the network
             let _network = unsafe { foundationdb::boot() };
-            mds::run(&listen, &mgs, &cluster_name).await?;
+            mds::run(&listen, mgs, &cluster_name).await?;
         }
         Commands::Oss {
             listen,
-            mgs,
             data_dir,
             ost_index,
         } => {
-            oss::run(&listen, &mgs, &data_dir, ost_index).await?;
+            oss::run(&listen, mgs, &data_dir, ost_index).await?;
         }
         Commands::Client(cmd) => {
-            client::run(cmd).await?;
+            client::run(cmd, mgs).await?;
         }
         Commands::Status { mgs } => {
             client::status(&mgs).await?;

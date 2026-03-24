@@ -6,6 +6,7 @@ use crate::client::rm::cmd_rm;
 use crate::error::{Result, RustreError};
 use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, RpcMessage, MSG_COUNTER};
 use crate::types::{ClusterConfig, StripeLayout};
+use crate::utils::timer::CommandTimer;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -41,10 +42,16 @@ pub fn ost_addr(config: &ClusterConfig, ost_index: u32) -> Result<String> {
 }
 
 /// Main entry point for client operations
-pub async fn run(cmd: ClientCommands) -> Result<()> {
-    match cmd {
+pub async fn run(cmd: ClientCommands, mgs: &str) -> Result<()> {
+    // Only format the command string when debug logging is enabled
+    let timer = if tracing::enabled!(tracing::Level::DEBUG) {
+        Some(CommandTimer::new(format!("{:?}", cmd)))
+    } else {
+        None
+    };
+
+    let result = match cmd {
         ClientCommands::Put {
-            mgs,
             source,
             dest,
             stripe_count,
@@ -52,7 +59,7 @@ pub async fn run(cmd: ClientCommands) -> Result<()> {
             replica_count,
         } => {
             cmd_put(
-                &mgs,
+                mgs,
                 &source,
                 &dest,
                 stripe_count,
@@ -61,12 +68,16 @@ pub async fn run(cmd: ClientCommands) -> Result<()> {
             )
             .await
         }
-        ClientCommands::Get { mgs, source, dest } => cmd_get(&mgs, &source, &dest).await,
-        ClientCommands::Ls { mgs, path } => cmd_ls(&mgs, &path).await,
-        ClientCommands::Mkdir { mgs, path } => cmd_mkdir(&mgs, &path).await,
-        ClientCommands::Rm { mgs, path } => cmd_rm(&mgs, &path).await,
-        ClientCommands::Stat { mgs, path } => cmd_stat(&mgs, &path).await,
+        ClientCommands::Get { source, dest } => cmd_get(mgs, &source, &dest).await,
+        ClientCommands::Ls { path } => cmd_ls(mgs, &path).await,
+        ClientCommands::Mkdir { path } => cmd_mkdir(mgs, &path).await,
+        ClientCommands::Rm { path } => cmd_rm(mgs, &path).await,
+        ClientCommands::Stat { path } => cmd_stat(mgs, &path).await,
+    };
+    if let Some(t) = timer {
+        t.finish(&result)
     }
+    result
 }
 
 async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
