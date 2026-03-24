@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # Quick-start script: launches MGS + MDS + 4 OSS instances for local testing.
 # Press Ctrl-C to stop all processes.
 
