@@ -14,8 +14,11 @@
 //! Stripe layouts are simplified — no per-object list, just parameters.
 //! Object IDs are deterministic: derived from (ino, stripe_seq).
 
+#[cfg(feature = "fdb")]
 pub mod operations;
+#[cfg(feature = "fdb")]
 pub mod path_utils;
+#[cfg(feature = "fdb")]
 pub mod server;
-
+#[cfg(feature = "fdb")]
 pub use server::run;
