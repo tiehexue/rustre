@@ -567,3 +567,121 @@ pub async fn handle_abort_create(
     info!("MDS: aborted pending file {} ino={ino}", meta.path);
     Ok(make_reply(req_id, RpcKind::Ok))
 }
+
+/// Handle rename operation
+pub async fn handle_rename(
+    req_id: u64,
+    old_path: &str,
+    new_path: &str,
+    state: &RwLock<MdsState>,
+) -> Result<RpcMessage> {
+    let old_path = path_utils::normalize_path(old_path);
+    let new_path = path_utils::normalize_path(new_path);
+
+    if old_path == "/" {
+        return Err(RustreError::InvalidArgument(
+            "cannot rename root directory".into(),
+        ));
+    }
+    if new_path == "/" {
+        return Err(RustreError::InvalidArgument(
+            "cannot rename to root directory".into(),
+        ));
+    }
+    if old_path == new_path {
+        // Nothing to do
+        return Ok(make_reply(req_id, RpcKind::Ok));
+    }
+
+    let st = state.read().await;
+
+    // Get the inode being renamed
+    let ino = st
+        .store
+        .resolve_path(&old_path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(old_path.clone()))?;
+
+    let mut meta = st
+        .store
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(old_path.clone()))?;
+
+    // Check if new parent directory exists
+    let new_parent = path_utils::parent_path(&new_path);
+    let new_parent_ino = st
+        .store
+        .resolve_path(&new_parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {new_parent}")))?;
+
+    let new_parent_meta = st
+        .store
+        .get_inode(new_parent_ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(new_parent.clone()))?;
+
+    if !new_parent_meta.is_dir {
+        return Err(RustreError::NotADirectory(new_parent));
+    }
+
+    // Check if new path already exists
+    if let Some(existing_ino) = st.store.resolve_path(&new_path).await? {
+        // Target exists - need to unlink it first (POSIX rename replaces)
+        let existing_meta = st
+            .store
+            .get_inode(existing_ino)
+            .await?
+            .ok_or_else(|| RustreError::NotFound(new_path.clone()))?;
+
+        if existing_meta.is_dir {
+            // Can't replace directory with non-directory or vice versa
+            if !meta.is_dir {
+                return Err(RustreError::InvalidArgument(
+                    "cannot replace directory with non-directory".into(),
+                ));
+            }
+            // Check if target directory is empty
+            if st.store.has_children(existing_ino).await? {
+                return Err(RustreError::DirNotEmpty(new_path));
+            }
+        } else if meta.is_dir {
+            return Err(RustreError::InvalidArgument(
+                "cannot replace non-directory with directory".into(),
+            ));
+        }
+
+        // Unlink the existing target
+        st.store
+            .txn_unlink(
+                existing_ino,
+                &new_path,
+                existing_meta.parent_ino,
+                existing_meta.is_dir,
+            )
+            .await?;
+    }
+
+    // Update metadata
+    let old_parent_ino = meta.parent_ino;
+    meta.path = new_path.clone();
+    meta.name = path_utils::basename(&new_path);
+    meta.parent_ino = new_parent_ino;
+    meta.mtime = FileMeta::now_secs();
+
+    // Perform the rename transaction atomically
+    st.store
+        .txn_rename(
+            ino,
+            &old_path,
+            &new_path,
+            old_parent_ino,
+            new_parent_ino,
+            &meta,
+        )
+        .await?;
+
+    info!("MDS: renamed {old_path} -> {new_path} ino={ino}");
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
