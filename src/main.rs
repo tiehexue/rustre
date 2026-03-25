@@ -10,6 +10,8 @@ mod client;
 mod error;
 mod mds;
 mod mgs;
+#[cfg(feature = "fuse")]
+mod mount;
 mod oss;
 mod rpc;
 mod storage;
@@ -81,16 +83,38 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:9400")]
         mgs: String,
     },
+    /// Mount the Rustre filesystem via FUSE (macOS/Linux)
+    #[cfg(feature = "fuse")]
+    Mount {
+        /// Local mountpoint directory
+        mountpoint: String,
+    },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Parse CLI arguments first
     let cli = Cli::parse();
 
     // Initialize logging based on the command and log level
     utils::logging::init_logging(&cli.command, &cli.log_level)?;
 
+    // FUSE mount creates its own tokio runtime internally (fuser callbacks are sync,
+    // RustreFs bridges to async via a dedicated runtime). We must NOT enter a tokio
+    // runtime before calling mount, otherwise we get "Cannot start a runtime from
+    // within a runtime". So we handle the Mount command before building the async rt.
+    #[cfg(feature = "fuse")]
+    if let Commands::Mount { ref mountpoint } = cli.command {
+        return mount::mount(&cli.mgs, mountpoint).map_err(Into::into);
+    }
+
+    // All other commands are async — spin up the tokio runtime
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mgs = &cli.mgs;
 
     match cli.command {
@@ -133,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status { mgs } => {
             client::status(&mgs).await?;
+        }
+        #[cfg(feature = "fuse")]
+        Commands::Mount { .. } => {
+            // Already handled in main() before the async runtime was created
+            unreachable!("Mount command is handled before async runtime");
         }
     }
 

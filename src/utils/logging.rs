@@ -27,6 +27,8 @@ pub fn get_log_file_name(command: &crate::Commands) -> String {
         crate::Commands::Oss { ost_index, .. } => format!("oss-{}.log", ost_index),
         crate::Commands::Client(_) => "client.log".to_string(),
         crate::Commands::Status { .. } => "status.log".to_string(),
+        #[cfg(feature = "fuse")]
+        crate::Commands::Mount { .. } => "mount.log".to_string(),
     }
 }
 
