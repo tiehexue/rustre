@@ -1,6 +1,6 @@
 # Rustre — Parallel Distributed File System
 
-A parallel, distributed file system inspired by [Lustre](https://www.lustre.org/), implemented in Rust as a single binary. Separated metadata and data paths, RAID-0 striping across object storage targets, zero-copy I/O, and FoundationDB-backed stateless servers.
+A parallel, distributed file system inspired by [Lustre](https://www.lustre.org/), implemented in Rust as a single binary. Separated metadata and data paths, striping/repicating across object storage targets, zero-copy I/O, and FoundationDB-backed stateless servers.
 
 ## Architecture
 
@@ -95,7 +95,7 @@ Children are individual keys — adding/removing a child is a single `set`/`clea
 
 ## Features
 
-- **RAID-0 striping** — files split into configurable chunks distributed round-robin across OSTs
+- **Striping** — files split into configurable chunks distributed round-robin across OSTs
 - **Zero-copy I/O** — `sendfile()` / `TransmitFile()` for both client→OSS writes and OSS→client reads
 - **Parallel I/O** — concurrent chunk reads/writes via tokio tasks
 - **Separated metadata/data paths** — metadata to MDS, data directly to OSTs
@@ -139,3 +139,9 @@ rustre client rm /data/file.dat                         # remove file
 rustre mgs -l 0.0.0.0:9410                              # additional MGS
 rustre mds -l 0.0.0.0:9411                              # additional MDS
 ```
+
+## Next Steps
+- **Zol** replace file store with zvol+chunk allocator, or raw block devices with chunk allocator. Rocksdb on filesystem for metadata in oss.
+- **Posix** make it mountable
+- **Testing** does this really works?
+- **RDMA** no env for testing...
