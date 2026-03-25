@@ -8,6 +8,10 @@ description = "A parallel, distributed file system inspired by Lustre, implement
 name = "rustre"
 path = "src/main.rs"
 
+[features]
+default = ["fdb"]
+fdb = ["foundationdb"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -18,11 +22,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 thiserror = "1"
 futures = "0.3"
 anyhow = "1"
-foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"] }
 rand = "0.8"
 chrono = "0.4"
 libc = "0.2"
 nix = { version = "0.28", features = ["fs", "socket"] }
+foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }

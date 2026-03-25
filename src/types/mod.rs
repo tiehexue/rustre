@@ -1,9 +1,9 @@
 //! File and metadata types
 
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
 
 /// Default stripe size: 1 MiB
+#[cfg(feature = "fdb")]
 pub const DEFAULT_STRIPE_SIZE: u64 = 1_048_576;
 
 /// Describes how a file's data is laid out across OSTs (RAID-0 striping).
@@ -120,7 +120,9 @@ pub struct FileMeta {
 }
 
 impl FileMeta {
+    #[cfg(feature = "fdb")]
     pub fn now_secs() -> u64 {
+        use std::time::SystemTime;
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

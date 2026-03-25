@@ -95,21 +95,31 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Mgs {
-            listen,
-            cluster_name,
+            listen: _listen,
+            cluster_name: _cluster_name,
         } => {
             // Initialize FoundationDB network (must happen once per process lifetime)
             // SAFETY: We call drop(network) at process exit via the tokio runtime shutdown.
-            let _network = unsafe { foundationdb::boot() };
-            mgs::run(&listen, &cluster_name).await?;
+            #[cfg(feature = "fdb")]
+            {
+                let _network = unsafe { foundationdb::boot() };
+                mgs::run(&_listen, &_cluster_name).await?;
+            }
+            #[cfg(not(feature = "fdb"))]
+            return Err(anyhow::anyhow!("MGS command requires FoundationDB support. Build with --features fdb or use default features."));
         }
         Commands::Mds {
-            listen,
-            cluster_name,
+            listen: _listen,
+            cluster_name: _cluster_name,
         } => {
             // MDS also uses FoundationDB — boot the network
-            let _network = unsafe { foundationdb::boot() };
-            mds::run(&listen, mgs, &cluster_name).await?;
+            #[cfg(feature = "fdb")]
+            {
+                let _network = unsafe { foundationdb::boot() };
+                mds::run(&_listen, mgs, &_cluster_name).await?;
+            }
+            #[cfg(not(feature = "fdb"))]
+            return Err(anyhow::anyhow!("MDS command requires FoundationDB support. Build with --features fdb or use default features."));
         }
         Commands::Oss {
             listen,

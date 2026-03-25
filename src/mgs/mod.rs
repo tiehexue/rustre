@@ -10,8 +10,11 @@
 //! Because all state lives in FDB, multiple MGS instances can run
 //! simultaneously for high availability — they are pure stateless proxies.
 
+#[cfg(feature = "fdb")]
 pub mod config;
+#[cfg(feature = "fdb")]
 pub mod heartbeat;
+#[cfg(feature = "fdb")]
 pub mod server;
-
+#[cfg(feature = "fdb")]
 pub use server::run;
