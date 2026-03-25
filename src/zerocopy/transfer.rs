@@ -17,19 +17,19 @@ async fn zerocopy_transfer(
     actual_chunk_size: usize,
 ) -> Result<()> {
     // Platform-specific setup
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     use std::sync::Arc;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     use std::os::windows::io::AsRawSocket;
 
     use crate::zerocopy::send_file;
 
     // Open the source file (platform-specific)
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let file = std::fs::File::open(source_path).map_err(|e| {
         RustreError::Io(std::io::Error::new(
             e.kind(),
@@ -37,7 +37,7 @@ async fn zerocopy_transfer(
         ))
     })?;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     let (file, file_descriptor) = {
         let file = std::fs::File::open(source_path).map_err(|e| {
             RustreError::Io(std::io::Error::new(
@@ -66,26 +66,26 @@ async fn zerocopy_transfer(
     send_msg(&mut primary_stream, &request_msg).await?;
 
     // Get socket descriptor (platform-specific)
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let socket_descriptor = primary_stream.as_raw_fd();
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     let socket_descriptor = primary_stream.as_raw_socket();
 
     // Perform zero-copy transfer (spawn_blocking to avoid blocking async runtime)
     let sendfile_result = {
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         let file_clone = file.try_clone().map_err(|e| {
             RustreError::Io(std::io::Error::new(
                 e.kind(),
                 format!("cloning file handle for primary transfer: {e}"),
             ))
         })?;
-        #[cfg(target_os = "windows")]
+        #[cfg(windows)]
         let file_ref = file_descriptor;
 
         tokio::task::spawn_blocking(move || {
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             return send_file(
                 file_clone.as_raw_fd(),
                 socket_descriptor,
@@ -93,7 +93,7 @@ async fn zerocopy_transfer(
                 actual_chunk_size,
             );
 
-            #[cfg(target_os = "windows")]
+            #[cfg(windows)]
             return send_file(&file_ref, socket_descriptor, file_offset, actual_chunk_size);
         })
         .await
@@ -127,14 +127,14 @@ async fn zerocopy_transfer(
                 let addr = replica_addr.clone();
                 let object_id = object_id.to_string();
 
-                #[cfg(target_os = "macos")]
+                #[cfg(unix)]
                 let file_clone = file.try_clone().map_err(|e| {
                     RustreError::Io(std::io::Error::new(
                         e.kind(),
                         format!("cloning file handle for replica transfer: {e}"),
                     ))
                 })?;
-                #[cfg(target_os = "windows")]
+                #[cfg(windows)]
                 let file_clone = Arc::clone(&file);
 
                 replica_futures.push(tokio::spawn(async move {
@@ -155,14 +155,14 @@ async fn zerocopy_transfer(
                     send_msg(&mut replica_stream, &request_msg).await?;
 
                     // Get socket descriptor for replica (platform-specific)
-                    #[cfg(target_os = "macos")]
+                    #[cfg(unix)]
                     let socket_fd = replica_stream.as_raw_fd();
-                    #[cfg(target_os = "windows")]
+                    #[cfg(windows)]
                     let socket = replica_stream.as_raw_socket();
 
                     // Perform zero-copy transfer to replica (spawn_blocking)
                     let sendfile_result = tokio::task::spawn_blocking(move || {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(unix)]
                         return send_file(
                             file_clone.as_raw_fd(),
                             socket_fd,
@@ -170,7 +170,7 @@ async fn zerocopy_transfer(
                             actual_chunk_size,
                         );
 
-                        #[cfg(target_os = "windows")]
+                        #[cfg(windows)]
                         return send_file(&file_clone, socket, file_offset, actual_chunk_size);
                     })
                     .await

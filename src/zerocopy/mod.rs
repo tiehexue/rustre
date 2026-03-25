@@ -1,22 +1,32 @@
 //! Zero-copy file transfer implementations for Rustre.
 //!
 //! Platform-specific `send_file()` using:
-//! - `sendfile()` on macOS (different signature from Linux)
+//! - `sendfile()` on Unix (macOS, Linux, etc.)
 //! - `TransmitFile()` on Windows
 
 pub mod transfer;
 
 // ---------------------------------------------------------------------------
-// macOS: sendfile(2)
+// Common imports and types
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
-use std::os::fd::RawFd;
-
-#[cfg(target_os = "macos")]
 use crate::error::RustreError;
 
-#[cfg(target_os = "macos")]
+// Platform-specific types
+#[cfg(unix)]
+use std::os::fd::RawFd;
+
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+// ---------------------------------------------------------------------------
+// Unix: sendfile(2) - unified implementation for macOS, Linux, and other Unix-like systems
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
 pub fn send_file(
     file_fd: RawFd,
     socket_fd: RawFd,
@@ -45,19 +55,40 @@ pub fn send_file(
 
     while remaining > 0 {
         let result = unsafe {
-            let mut bytes_sent: libc::off_t = remaining as libc::off_t;
-            let ret = libc::sendfile(
-                file_fd,
-                socket_fd,
-                off,
-                &mut bytes_sent,
-                std::ptr::null_mut(),
-                0,
-            );
-            if ret == 0 {
-                bytes_sent as libc::ssize_t
-            } else {
-                -1
+            #[cfg(target_os = "macos")]
+            {
+                let mut bytes_sent: libc::off_t = remaining as libc::off_t;
+                let ret = libc::sendfile(
+                    file_fd,
+                    socket_fd,
+                    off,
+                    &mut bytes_sent,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if ret == 0 {
+                    bytes_sent as libc::ssize_t
+                } else {
+                    -1
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Linux sendfile signature: sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+                libc::sendfile(
+                    socket_fd, // out_fd - destination socket
+                    file_fd,   // in_fd - source file
+                    &mut off,  // offset - pointer that gets updated
+                    remaining, // count - bytes to transfer
+                )
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                // Default Unix implementation (for other Unix-like systems)
+                // This assumes the Linux signature, which is more common
+                libc::sendfile(socket_fd, file_fd, &mut off, remaining)
             }
         };
 
@@ -76,7 +107,12 @@ pub fn send_file(
 
         total_sent += sent;
         remaining -= sent;
-        off += sent as libc::off_t;
+
+        // Update offset for macOS (Linux updates it automatically via &mut off)
+        #[cfg(target_os = "macos")]
+        {
+            off += sent as libc::off_t;
+        }
     }
 
     debug!("send_file: {total_sent} bytes from offset {offset}");
@@ -92,15 +128,6 @@ pub fn send_file(
 // ---------------------------------------------------------------------------
 // Windows: TransmitFile
 // ---------------------------------------------------------------------------
-
-#[cfg(target_os = "windows")]
-use std::os::windows::io::RawSocket;
-
-#[cfg(target_os = "windows")]
-use crate::error::RustreError;
-
-#[cfg(target_os = "windows")]
-use std::os::windows::io::AsRawHandle;
 
 /// Windows zero-copy via TransmitFile — the kernel-mode equivalent of sendfile.
 #[cfg(target_os = "windows")]
