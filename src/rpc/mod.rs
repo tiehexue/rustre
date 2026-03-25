@@ -48,6 +48,10 @@ pub enum RpcKind {
         path: String,
         size: u64,
     },
+    Rename {
+        old_path: String,
+        new_path: String,
+    },
 
     // -- OSS (zero-copy: data follows the RPC header on the wire) --
     ObjWriteZeroCopy {

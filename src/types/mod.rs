@@ -120,7 +120,7 @@ pub struct FileMeta {
 }
 
 impl FileMeta {
-    #[cfg(feature = "fdb")]
+    #[cfg(any(feature = "fdb", feature = "fuse"))]
     pub fn now_secs() -> u64 {
         use std::time::SystemTime;
         SystemTime::now()

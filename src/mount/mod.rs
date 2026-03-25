@@ -20,7 +20,7 @@ use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, RpcMessage, MSG_COUNTER}
 use crate::types::{ClusterConfig, CreateReq, FileMeta, StripeLayout};
 use fuser::{
     BsdFileFlags, Config, Errno, FileHandle, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags,
-    SessionACL, TimeOrNow, WriteFlags,
+    RenameFlags, SessionACL, TimeOrNow, WriteFlags,
 };
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -614,6 +614,85 @@ async fn write_chunk_to_ost(addr: &str, object_id: &str, data: &[u8]) -> Result<
 // ---------------------------------------------------------------------------
 
 impl Filesystem for RustreFs {
+    /// Rename a file.
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        // Build old and new paths
+        let old_path = match self.child_path(parent.0, name) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+        let new_path = match self.child_path(newparent.0, newname) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+
+        // Call MDS rename RPC
+        let result = self.rt.block_on(async {
+            let mds = self.pick_mds()?;
+            let reply = rpc_call(
+                &mds,
+                RpcKind::Rename {
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
+            match reply.kind {
+                RpcKind::Ok => Ok(()),
+                RpcKind::Error(e) => {
+                    if e.contains("not found") {
+                        Err(Errno::ENOENT)
+                    } else if e.contains("already exists") {
+                        Err(Errno::EEXIST)
+                    } else if e.contains("not a directory") {
+                        Err(Errno::ENOTDIR)
+                    } else if e.contains("directory not empty") {
+                        Err(Errno::ENOTEMPTY)
+                    } else if e.contains("invalid argument") {
+                        Err(Errno::EINVAL)
+                    } else {
+                        Err(Errno::EIO)
+                    }
+                }
+                _ => Err(Errno::EIO),
+            }
+        });
+
+        match result {
+            Ok(()) => {
+                // Update cache: remove old path, add new path
+                if let Ok(mut inodes) = self.inodes.write() {
+                    // Get the ino from old path
+                    if let Some(ino) = inodes.path_to_ino.get(&old_path).copied() {
+                        // Remove old path mapping
+                        inodes.path_to_ino.remove(&old_path);
+                        // Add new path mapping
+                        inodes.path_to_ino.insert(new_path.clone(), ino);
+                        // Update metadata in cache if present
+                        if let Some(entry) = inodes.entries.get_mut(&ino) {
+                            entry.meta.path = new_path;
+                            entry.meta.name = newname.to_str().unwrap_or("").to_string();
+                            entry.meta.parent_ino = newparent.0;
+                            entry.meta.mtime = FileMeta::now_secs();
+                        }
+                    }
+                }
+                reply.ok();
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
     // -- lookup: resolve parent + name → child attributes --
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let path = match self.child_path(parent.0, name) {

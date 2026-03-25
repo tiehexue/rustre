@@ -81,6 +81,9 @@ async fn handle_connection(
             operations::handle_commit_create(msg.id, ino, size, &state).await
         }
         RpcKind::AbortCreate { ino } => operations::handle_abort_create(msg.id, ino, &state).await,
+        RpcKind::Rename { old_path, new_path } => {
+            operations::handle_rename(msg.id, &old_path, &new_path, &state).await
+        }
         RpcKind::Heartbeat => {
             // Respond to heartbeat immediately
             Ok(make_reply(msg.id, RpcKind::HeartbeatReply))

@@ -279,6 +279,52 @@ impl FdbMdsStore {
         Ok(())
     }
 
+    /// Atomically rename a file/directory: update inode metadata, path mapping, and parent-child links.
+    pub async fn txn_rename(
+        &self,
+        ino: u64,
+        old_path: &str,
+        new_path: &str,
+        old_parent_ino: u64,
+        new_parent_ino: u64,
+        meta: &crate::types::FileMeta,
+    ) -> Result<()> {
+        let ino_key = self.ino_key(ino);
+        let old_path_key = self.path_key(old_path);
+        let new_path_key = self.path_key(new_path);
+        let old_child_key = self.child_key(old_parent_ino, ino);
+        let new_child_key = self.child_key(new_parent_ino, ino);
+
+        let meta_data =
+            bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
+        let ino_data = ino.to_le_bytes().to_vec();
+
+        self.db
+            .run(|trx, _| {
+                let ino_key = ino_key.clone();
+                let old_path_key = old_path_key.clone();
+                let new_path_key = new_path_key.clone();
+                let old_child_key = old_child_key.clone();
+                let new_child_key = new_child_key.clone();
+                let meta_data = meta_data.clone();
+                let ino_data = ino_data.clone();
+                async move {
+                    // Update inode metadata
+                    trx.set(&ino_key, &meta_data);
+                    // Update path mappings
+                    trx.clear(&old_path_key);
+                    trx.set(&new_path_key, &ino_data);
+                    // Update parent-child relationships
+                    trx.clear(&old_child_key);
+                    trx.set(&new_child_key, &[]);
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| RustreError::Fdb(format!("FDB txn_rename: {e}")))?;
+        Ok(())
+    }
+
     /// Initialize the root directory (ino=1) if it doesn't already exist.
     /// Note: Does NOT initialize the inode counter — that is managed by MGS.
     pub async fn ensure_root(&self) -> Result<()> {
