@@ -30,8 +30,8 @@ use fuser::{
     TimeOrNow, WriteFlags,
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use parking_lot::{Mutex, RwLock};
 use std::ffi::OsStr;
@@ -178,12 +178,26 @@ impl InodeMap {
 // Open file handle — per-file state with fine-grained locking
 // ---------------------------------------------------------------------------
 
+struct IoOrder {
+    next_ticket: AtomicU64,
+    serving_ticket: AtomicU64,
+}
+
 struct OpenFile {
     ino: u64,
     meta: FileMeta,
     /// Write buffer: append-only list of (offset, data) pairs.
     /// Still used by the legacy flush path and for zero-byte commit cases.
     write_buf: Mutex<Vec<(u64, Vec<u8>)>>,
+    /// Ticket-based ordering for mutating operations on one fh.
+    ///
+    /// write-through does per-request chunk-level read-modify-write against OSS.
+    /// Toolchains like rustc frequently revisit the same low offsets (`0`, `49_152`,
+    /// `65_536`, etc.) while also extending the file. If two callbacks on the same
+    /// handle interleave, a later whole-chunk write can clobber bytes written by the
+    /// earlier callback. Ticketing keeps write/flush/truncate strictly serialized
+    /// without holding a mutex across `block_on()`.
+    io_order: Arc<IoOrder>,
     /// Current tracked file size (atomic for lock-free reads from getattr)
     tracked_size: AtomicU64,
     /// Whether this file was opened for writing
@@ -209,6 +223,19 @@ pub struct RustreFs {
     open_files: Arc<DashMap<u64, OpenFile>>,
     /// Next file handle number
     next_fh: AtomicU64,
+}
+
+struct IoTurnGuard {
+    io_order: Arc<IoOrder>,
+    ticket: u64,
+}
+
+impl Drop for IoTurnGuard {
+    fn drop(&mut self) {
+        self.io_order
+            .serving_ticket
+            .store(self.ticket + 1, Ordering::Release);
+    }
 }
 
 impl RustreFs {
@@ -281,6 +308,20 @@ impl RustreFs {
     /// Snapshot cluster config (clone under brief read lock, then drop lock).
     fn snap_config(&self) -> ClusterConfig {
         self.config.read().clone()
+    }
+
+    /// Serialize mutating operations on one file handle via a ticket lock.
+    fn acquire_io_turn(&self, fh: u64) -> Result<IoTurnGuard, Errno> {
+        let io_order = self
+            .open_files
+            .get(&fh)
+            .map(|file_ref| Arc::clone(&file_ref.io_order))
+            .ok_or(Errno::EBADF)?;
+        let ticket = io_order.next_ticket.fetch_add(1, Ordering::Relaxed);
+        while io_order.serving_ticket.load(Ordering::Acquire) != ticket {
+            std::thread::yield_now();
+        }
+        Ok(IoTurnGuard { io_order, ticket })
     }
 
     /// Pick a random MDS address from snapshot.
@@ -412,7 +453,14 @@ impl RustreFs {
     /// This makes newly written bytes visible before close()/flush(), which is
     /// critical for toolchains that reopen, mmap, or back-patch their outputs
     /// while the same file handle is still alive.
-    fn write_through(&self, ino: u64, meta: &FileMeta, logical_size: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
+    fn write_through(
+        &self,
+        ino: u64,
+        meta: &FileMeta,
+        logical_size: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Errno> {
         if data.is_empty() {
             return Ok(());
         }
@@ -463,6 +511,8 @@ impl RustreFs {
 
     /// Flush write buffers for an open file — performs the two-phase commit.
     fn flush_writes(&self, fh: u64) -> Result<(), Errno> {
+        let _io_turn = self.acquire_io_turn(fh)?;
+
         // Get file info from the DashMap — take write_buf under per-file lock
         let (ino, meta, write_buf, pending, size_dirty) = {
             let file_ref = self.open_files.get(&fh).ok_or(Errno::EBADF)?;
@@ -475,7 +525,13 @@ impl RustreFs {
             if is_empty && !file.pending && !file.size_dirty {
                 return Ok(());
             }
-            (file.ino, file.meta.clone(), buf, file.pending, file.size_dirty)
+            (
+                file.ino,
+                file.meta.clone(),
+                buf,
+                file.pending,
+                file.size_dirty,
+            )
         };
 
         if write_buf.is_empty() {
@@ -590,8 +646,7 @@ impl RustreFs {
                     let dst_end = (write_end_in_file - chunk_file_start) as usize;
                     let src_start = (write_start_in_file - min_off) as usize;
                     let src_end = (write_end_in_file - min_off) as usize;
-                    chunk_data[dst_start..dst_end]
-                        .copy_from_slice(&flat_buf[src_start..src_end]);
+                    chunk_data[dst_start..dst_end].copy_from_slice(&flat_buf[src_start..src_end]);
                 }
 
                 // If this chunk is only partially written and the file already had data
@@ -602,8 +657,7 @@ impl RustreFs {
                 if !chunk_fully_covered && meta.size > chunk_file_start {
                     let object_id = StripeLayout::object_id(ino, chunk_idx);
                     let ost_index = layout_clone.ost_for_chunk(chunk_idx);
-                    let addr =
-                        ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
+                    let addr = ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
                     if let Ok(existing) = read_chunk_from_ost(&addr, &object_id).await {
                         if !existing.is_empty() {
                             // Merge: fill in only the bytes NOT covered by our write
@@ -764,7 +818,11 @@ async fn write_chunk_to_ost(addr: &str, object_id: &str, data: &[u8]) -> Result<
 
 impl Filesystem for RustreFs {
     // -- init: called when the filesystem is mounted --
-    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), std::io::Error> {
         // If the kernel supports mmap on direct-IO files, opt in. We return
         // FOPEN_DIRECT_IO only for writable handles to avoid macFUSE buffered-write
         // corruption, and this keeps mmap-based writers working when supported.
@@ -924,9 +982,7 @@ impl Filesystem for RustreFs {
         // Handle truncate
         if let Some(new_size) = size {
             // First try explicit file handle
-            let maybe_fh = fh.and_then(|fh_val| {
-                self.open_files.get(&fh_val.0).map(|_| fh_val.0)
-            });
+            let maybe_fh = fh.and_then(|fh_val| self.open_files.get(&fh_val.0).map(|_| fh_val.0));
 
             // If no fh provided (or fh not found), search by ino
             let effective_fh = maybe_fh.or_else(|| {
@@ -938,6 +994,15 @@ impl Filesystem for RustreFs {
                     }
                 })
             });
+
+            let _io_turn = if let Some(fh_val) = effective_fh {
+                match self.acquire_io_turn(fh_val) {
+                    Ok(turn) => Some(turn),
+                    Err(e) => return reply.error(e),
+                }
+            } else {
+                None
+            };
 
             // Check if the open file is pending (created via create(), not yet committed).
             // Pending files should NEVER call MDS SetSize — their final size is set
@@ -1332,15 +1397,9 @@ impl Filesystem for RustreFs {
             };
             let path = meta.path.clone();
             let result = self.rt.block_on(async {
-                let rpc_reply = rpc_call(
-                    &mds,
-                    RpcKind::SetSize {
-                        path,
-                        size: 0,
-                    },
-                )
-                .await
-                .map_err(rustre_err_to_errno)?;
+                let rpc_reply = rpc_call(&mds, RpcKind::SetSize { path, size: 0 })
+                    .await
+                    .map_err(rustre_err_to_errno)?;
                 match rpc_reply.kind {
                     RpcKind::Ok => Ok(()),
                     RpcKind::Error(e) => {
@@ -1365,11 +1424,16 @@ impl Filesystem for RustreFs {
             meta.size, meta.path,
         );
 
+        let tracked_size = meta.size;
         let open_file = OpenFile {
             ino: ino_val,
-            tracked_size: AtomicU64::new(meta.size),
             meta,
             write_buf: Mutex::new(Vec::new()),
+            io_order: Arc::new(IoOrder {
+                next_ticket: AtomicU64::new(0),
+                serving_ticket: AtomicU64::new(0),
+            }),
+            tracked_size: AtomicU64::new(tracked_size),
             writable,
             pending: false,
             size_dirty: false,
@@ -1501,9 +1565,13 @@ impl Filesystem for RustreFs {
         // Create open file handle
         let open_file = OpenFile {
             ino,
-            tracked_size: AtomicU64::new(0),
             meta,
             write_buf: Mutex::new(Vec::new()),
+            io_order: Arc::new(IoOrder {
+                next_ticket: AtomicU64::new(0),
+                serving_ticket: AtomicU64::new(0),
+            }),
+            tracked_size: AtomicU64::new(0),
             writable: true,
             pending: true, // Will be committed on flush/release
             size_dirty: false,
@@ -1539,6 +1607,10 @@ impl Filesystem for RustreFs {
         reply: ReplyWrite,
     ) {
         let fh_val = fh.0;
+        let _io_turn = match self.acquire_io_turn(fh_val) {
+            Ok(turn) => turn,
+            Err(e) => return reply.error(e),
+        };
         let (ino, meta, pending, current_size) = match self.open_files.get(&fh_val) {
             Some(file_ref) => {
                 let file = file_ref.value();
@@ -1810,13 +1882,7 @@ impl Filesystem for RustreFs {
         reply.ok();
     }
 
-    fn removexattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        reply: ReplyEmpty,
-    ) {
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         // Silently succeed — same rationale as setxattr
         reply.ok();
     }
