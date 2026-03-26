@@ -118,6 +118,13 @@ pub enum RpcKind {
         start: u64,
         end: u64,
     },
+
+    // -- Hard link support --
+    /// Create a hard link: new_path → existing inode.
+    Link {
+        ino: u64,
+        new_path: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

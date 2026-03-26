@@ -325,6 +325,41 @@ impl FdbMdsStore {
         Ok(())
     }
 
+    /// Atomically create a hard link: update inode metadata (nlink), add path mapping, add parent-child entry.
+    pub async fn txn_link(
+        &self,
+        ino: u64,
+        meta: &crate::types::FileMeta,
+        new_path: &str,
+        new_parent_ino: u64,
+    ) -> Result<()> {
+        let ino_key = self.ino_key(ino);
+        let path_key = self.path_key(new_path);
+        let child_key = self.child_key(new_parent_ino, ino);
+
+        let meta_data =
+            bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
+        let ino_data = ino.to_le_bytes().to_vec();
+
+        self.db
+            .run(|trx, _| {
+                let ino_key = ino_key.clone();
+                let path_key = path_key.clone();
+                let child_key = child_key.clone();
+                let meta_data = meta_data.clone();
+                let ino_data = ino_data.clone();
+                async move {
+                    trx.set(&ino_key, &meta_data);
+                    trx.set(&path_key, &ino_data);
+                    trx.set(&child_key, &[]);
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| RustreError::Fdb(format!("FDB txn_link: {e}")))?;
+        Ok(())
+    }
+
     /// Initialize the root directory (ino=1) if it doesn't already exist.
     /// Note: Does NOT initialize the inode counter — that is managed by MGS.
     pub async fn ensure_root(&self) -> Result<()> {
@@ -346,6 +381,7 @@ impl FdbMdsStore {
             layout: None,
             parent_ino: 0,
             pending: false,
+            nlink: 2, // root dir: . and parent
         };
 
         // Atomically set root inode + path in one transaction

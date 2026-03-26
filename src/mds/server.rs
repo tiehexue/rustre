@@ -84,6 +84,9 @@ async fn handle_connection(
         RpcKind::Rename { old_path, new_path } => {
             operations::handle_rename(msg.id, &old_path, &new_path, &state).await
         }
+        RpcKind::Link { ino, new_path } => {
+            operations::handle_link(msg.id, ino, &new_path, &state).await
+        }
         RpcKind::Heartbeat => {
             // Respond to heartbeat immediately
             Ok(make_reply(msg.id, RpcKind::HeartbeatReply))

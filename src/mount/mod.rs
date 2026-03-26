@@ -3,9 +3,14 @@
 //! Architecture:
 //!   - `RustreFs` implements `fuser::Filesystem` (async via a dedicated tokio runtime)
 //!   - Inode numbers from Rustre MDS are used directly as FUSE inode numbers
-//!   - `InodeMap` caches ino→path and ino→FileMeta for fast lookups
-//!   - File handles track open files with their stripe layout
-//!   - Write buffering aggregates small writes into stripe-sized chunks
+//!   - `InodeMap`: two `DashMap`s (entries + path_to_ino) — no outer lock, all methods `&self`
+//!   - Open files: `DashMap<u64, OpenFile>` — per-file fine-grained locking
+//!   - Write buffering: per-file `parking_lot::Mutex<Vec<(u64, Vec<u8>)>>` for correct
+//!     overlapping-write semantics (Finder sends many small writes)
+//!   - Config: `parking_lot::RwLock<ClusterConfig>` — always snapshot-clone before block_on
+//!
+//! Key rule: NEVER hold any lock across `block_on()` — prevents deadlock with
+//! the background config refresher task.
 //!
 //! Reuses existing infrastructure:
 //!   - `client::operations::{get_config, mds_addr, ost_addr}` for cluster access
@@ -18,22 +23,24 @@ use crate::client::operations::{get_config, mds_addr, ost_addr};
 use crate::error::RustreError;
 use crate::rpc::{recv_msg, rpc_call, send_msg, RpcKind, RpcMessage, MSG_COUNTER};
 use crate::types::{ClusterConfig, CreateReq, FileMeta, StripeLayout};
+use dashmap::DashMap;
 use fuser::{
-    BsdFileFlags, Config, Errno, FileHandle, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags,
-    RenameFlags, SessionACL, TimeOrNow, WriteFlags,
+    AccessFlags, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileHandle, FopenFlags,
+    Generation, INodeNo, InitFlags, IoctlFlags, LockOwner, OpenFlags, RenameFlags, SessionACL,
+    TimeOrNow, WriteFlags,
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -103,8 +110,8 @@ fn meta_to_attr(meta: &FileMeta) -> FileAttr {
         ctime,
         crtime: ctime,
         kind,
-        perm: if meta.is_dir { 0o755 } else { 0o644 },
-        nlink: if meta.is_dir { 2 } else { 1 },
+        perm: 0o755,
+        nlink: meta.nlink,
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         rdev: 0,
@@ -114,63 +121,77 @@ fn meta_to_attr(meta: &FileMeta) -> FileAttr {
 }
 
 // ---------------------------------------------------------------------------
-// Inode cache: ino → (path, FileMeta)
+// Inode cache — lock-free via DashMap
 // ---------------------------------------------------------------------------
-
-struct InodeEntry {
-    meta: FileMeta,
-}
 
 struct InodeMap {
     /// ino → cached metadata
-    entries: HashMap<u64, InodeEntry>,
-    /// path → ino (for reverse lookups, e.g. parent_ino + name → child ino)
-    path_to_ino: HashMap<String, u64>,
+    entries: DashMap<u64, FileMeta>,
+    /// path → ino (for reverse lookups)
+    path_to_ino: DashMap<String, u64>,
 }
 
 impl InodeMap {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            path_to_ino: HashMap::new(),
+            entries: DashMap::new(),
+            path_to_ino: DashMap::new(),
         }
     }
 
-    fn insert(&mut self, meta: FileMeta) {
+    fn insert(&self, meta: FileMeta) {
         let ino = meta.ino;
         let path = meta.path.clone();
         self.path_to_ino.insert(path, ino);
-        self.entries.insert(ino, InodeEntry { meta });
+        self.entries.insert(ino, meta);
     }
 
-    fn get(&self, ino: u64) -> Option<&FileMeta> {
-        self.entries.get(&ino).map(|e| &e.meta)
+    fn get_meta(&self, ino: u64) -> Option<FileMeta> {
+        self.entries.get(&ino).map(|e| e.value().clone())
     }
 
-    fn get_path(&self, ino: u64) -> Option<&str> {
-        self.entries.get(&ino).map(|e| e.meta.path.as_str())
+    fn get_path(&self, ino: u64) -> Option<String> {
+        self.entries.get(&ino).map(|e| e.value().path.clone())
     }
 
-    fn remove(&mut self, ino: u64) {
-        if let Some(entry) = self.entries.remove(&ino) {
-            self.path_to_ino.remove(&entry.meta.path);
+    fn update_size(&self, ino: u64, size: u64) {
+        if let Some(mut e) = self.entries.get_mut(&ino) {
+            e.size = size;
+            e.mtime = FileMeta::now_secs();
+        }
+    }
+
+    fn update_pending(&self, ino: u64, pending: bool) {
+        if let Some(mut e) = self.entries.get_mut(&ino) {
+            e.pending = pending;
+        }
+    }
+
+    fn remove(&self, ino: u64) {
+        if let Some((_, meta)) = self.entries.remove(&ino) {
+            self.path_to_ino.remove(&meta.path);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Open file handle — tracks open files for reads/writes
+// Open file handle — per-file state with fine-grained locking
 // ---------------------------------------------------------------------------
 
 struct OpenFile {
     ino: u64,
     meta: FileMeta,
-    /// Write buffer: offset → data. Flushed on flush/release.
-    write_buf: HashMap<u64, Vec<u8>>,
+    /// Write buffer: append-only list of (offset, data) pairs.
+    /// Still used by the legacy flush path and for zero-byte commit cases.
+    write_buf: Mutex<Vec<(u64, Vec<u8>)>>,
+    /// Current tracked file size (atomic for lock-free reads from getattr)
+    tracked_size: AtomicU64,
     /// Whether this file was opened for writing
     writable: bool,
     /// For new files created via create(): true until committed
     pending: bool,
+    /// Existing file size changed locally and still needs an MDS SetSize.
+    size_dirty: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +203,10 @@ pub struct RustreFs {
     rt: tokio::runtime::Runtime,
     /// Cached cluster configuration (refreshed periodically)
     config: Arc<RwLock<ClusterConfig>>,
-    /// Inode cache
-    inodes: Arc<RwLock<InodeMap>>,
-    /// Open file handles: fh → OpenFile
-    open_files: Arc<RwLock<HashMap<u64, OpenFile>>>,
+    /// Inode cache (lock-free DashMap)
+    inodes: Arc<InodeMap>,
+    /// Open file handles: fh → OpenFile (lock-free DashMap)
+    open_files: Arc<DashMap<u64, OpenFile>>,
     /// Next file handle number
     next_fh: AtomicU64,
 }
@@ -201,7 +222,7 @@ impl RustreFs {
         let config = rt.block_on(get_config(mgs_addr))?;
 
         // Seed root inode in cache
-        let mut inode_map = InodeMap::new();
+        let inode_map = InodeMap::new();
 
         // Query MDS for root to get the real root inode
         let root_meta = rt.block_on(async {
@@ -237,9 +258,7 @@ impl RustreFs {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 match get_config(&mgs_clone).await {
                     Ok(cfg) => {
-                        if let Ok(mut c) = config_clone.write() {
-                            *c = cfg;
-                        }
+                        *config_clone.write() = cfg;
                     }
                     Err(e) => warn!("config refresh failed: {e}"),
                 }
@@ -249,34 +268,31 @@ impl RustreFs {
         Ok(Self {
             rt,
             config,
-            inodes: Arc::new(RwLock::new(inode_map)),
-            open_files: Arc::new(RwLock::new(HashMap::new())),
+            inodes: Arc::new(inode_map),
+            open_files: Arc::new(DashMap::new()),
             next_fh: AtomicU64::new(1),
         })
     }
 
     // -----------------------------------------------------------------------
-    // Internal helpers — run async operations on the embedded runtime
+    // Internal helpers — snapshot config before block_on to avoid deadlocks
     // -----------------------------------------------------------------------
 
-    /// Get a random MDS address from cached config.
-    fn pick_mds(&self) -> Result<String, Errno> {
-        let cfg = self.config.read().map_err(|_| Errno::EIO)?;
-        mds_addr(&cfg).map_err(rustre_err_to_errno)
+    /// Snapshot cluster config (clone under brief read lock, then drop lock).
+    fn snap_config(&self) -> ClusterConfig {
+        self.config.read().clone()
     }
 
-    /// Get cluster config snapshot.
-    fn get_cached_config(&self) -> Result<ClusterConfig, Errno> {
-        self.config
-            .read()
-            .map(|c| c.clone())
-            .map_err(|_| Errno::EIO)
+    /// Pick a random MDS address from snapshot.
+    fn pick_mds(&self) -> Result<String, Errno> {
+        let cfg = self.snap_config();
+        mds_addr(&cfg).map_err(rustre_err_to_errno)
     }
 
     /// Stat a path via MDS, returning FileMeta on success.
     fn stat_path(&self, path: &str) -> Result<FileMeta, Errno> {
+        let mds = self.pick_mds()?;
         self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let reply = rpc_call(&mds, RpcKind::Stat(path.to_string()))
                 .await
                 .map_err(rustre_err_to_errno)?;
@@ -297,8 +313,7 @@ impl RustreFs {
     /// Build child path from parent ino + child name.
     fn child_path(&self, parent: u64, name: &OsStr) -> Result<String, Errno> {
         let name_str = name.to_str().ok_or(Errno::EINVAL)?;
-        let inodes = self.inodes.read().map_err(|_| Errno::EIO)?;
-        let parent_path = inodes.get_path(parent).ok_or(Errno::ENOENT)?;
+        let parent_path = self.inodes.get_path(parent).ok_or(Errno::ENOENT)?;
         if parent_path == "/" {
             Ok(format!("/{name_str}"))
         } else {
@@ -310,7 +325,7 @@ impl RustreFs {
     fn read_data(&self, meta: &FileMeta, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
         let layout = meta.layout.as_ref().ok_or(Errno::EIO)?;
         let file_size = meta.size;
-        let config = self.get_cached_config()?;
+        let config = self.snap_config();
 
         // Clamp read to file bounds
         if offset >= file_size {
@@ -369,21 +384,101 @@ impl RustreFs {
         })
     }
 
+    fn sync_size_to_mds(&self, meta: &FileMeta, size: u64) -> Result<(), Errno> {
+        let mds = self.pick_mds()?;
+        self.rt.block_on(async {
+            let rpc_reply = rpc_call(
+                &mds,
+                RpcKind::SetSize {
+                    path: meta.path.clone(),
+                    size,
+                },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
+            match rpc_reply.kind {
+                RpcKind::Ok => Ok(()),
+                RpcKind::Error(e) => {
+                    error!("setsize failed: {e}");
+                    Err(Errno::EIO)
+                }
+                _ => Err(Errno::EIO),
+            }
+        })
+    }
+
+    /// Write a single userspace write request through to the relevant OST chunks.
+    ///
+    /// This makes newly written bytes visible before close()/flush(), which is
+    /// critical for toolchains that reopen, mmap, or back-patch their outputs
+    /// while the same file handle is still alive.
+    fn write_through(&self, ino: u64, meta: &FileMeta, logical_size: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let layout = meta.layout.as_ref().ok_or(Errno::EIO)?;
+        let config = self.snap_config();
+        let chunk_size = layout.stripe_size;
+        let write_end = offset + data.len() as u64;
+        let first_chunk = (offset / chunk_size) as u32;
+        let last_chunk = ((write_end - 1) / chunk_size) as u32;
+        let layout_clone = layout.clone();
+        let config_clone = config.clone();
+        let data = data.to_vec();
+
+        self.rt.block_on(async move {
+            for chunk_idx in first_chunk..=last_chunk {
+                let chunk_file_start = chunk_idx as u64 * chunk_size;
+                let chunk_file_end = chunk_file_start + chunk_size;
+                let chunk_logical_end = std::cmp::min(logical_size, chunk_file_end);
+                let logical_len = chunk_logical_end.saturating_sub(chunk_file_start) as usize;
+
+                let write_start = std::cmp::max(offset, chunk_file_start);
+                let write_end = std::cmp::min(offset + data.len() as u64, chunk_file_end);
+                if write_start >= write_end {
+                    continue;
+                }
+
+                let object_id = StripeLayout::object_id(ino, chunk_idx);
+                let ost_index = layout_clone.ost_for_chunk(chunk_idx);
+                let addr = ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
+
+                let existing = read_chunk_from_ost(&addr, &object_id).await?;
+                let target_len = std::cmp::max(existing.len(), logical_len);
+                let mut chunk_data = vec![0u8; target_len];
+                chunk_data[..existing.len()].copy_from_slice(&existing);
+
+                let dst_start = (write_start - chunk_file_start) as usize;
+                let dst_end = (write_end - chunk_file_start) as usize;
+                let src_start = (write_start - offset) as usize;
+                let src_end = (write_end - offset) as usize;
+                chunk_data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+
+                write_chunk_to_ost(&addr, &object_id, &chunk_data).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// Flush write buffers for an open file — performs the two-phase commit.
     fn flush_writes(&self, fh: u64) -> Result<(), Errno> {
-        // Take the write buffer out
-        let (ino, meta, write_buf, pending) = {
-            let mut files = self.open_files.write().map_err(|_| Errno::EIO)?;
-            let file = files.get_mut(&fh).ok_or(Errno::EBADF)?;
-            if file.write_buf.is_empty() && !file.pending {
+        // Get file info from the DashMap — take write_buf under per-file lock
+        let (ino, meta, write_buf, pending, size_dirty) = {
+            let file_ref = self.open_files.get(&fh).ok_or(Errno::EBADF)?;
+            let file = file_ref.value();
+            let buf = {
+                let mut wb = file.write_buf.lock();
+                std::mem::take(&mut *wb)
+            };
+            let is_empty = buf.is_empty();
+            if is_empty && !file.pending && !file.size_dirty {
                 return Ok(());
             }
-            let buf = std::mem::take(&mut file.write_buf);
-            (file.ino, file.meta.clone(), buf, file.pending)
+            (file.ino, file.meta.clone(), buf, file.pending, file.size_dirty)
         };
 
         if write_buf.is_empty() {
-            // Still need to commit if pending
             if pending {
                 self.rt.block_on(async {
                     let mds = self.pick_mds()?;
@@ -405,82 +500,131 @@ impl RustreFs {
                         _ => Err(Errno::EIO),
                     }
                 })?;
-                // Mark as no longer pending
-                if let Ok(mut files) = self.open_files.write() {
-                    if let Some(file) = files.get_mut(&fh) {
-                        file.pending = false;
-                    }
+                if let Some(mut file_ref) = self.open_files.get_mut(&fh) {
+                    file_ref.pending = false;
+                    file_ref.size_dirty = false;
                 }
+                self.inodes.update_pending(ino, false);
+            } else if size_dirty {
+                self.sync_size_to_mds(&meta, meta.size)?;
+                if let Some(mut file_ref) = self.open_files.get_mut(&fh) {
+                    file_ref.size_dirty = false;
+                }
+                self.inodes.update_size(ino, meta.size);
             }
             return Ok(());
         }
 
         let layout = meta.layout.as_ref().ok_or(Errno::EIO)?;
-        let config = self.get_cached_config()?;
+        let config = self.snap_config();
         let chunk_size = layout.stripe_size as usize;
 
-        // Group writes by chunk index
-        let mut chunks: HashMap<u32, Vec<u8>> = HashMap::new();
-        for (&off, data) in &write_buf {
-            let start_chunk = (off / chunk_size as u64) as u32;
-            let end_off = off + data.len() as u64;
-            let end_chunk = if end_off == 0 {
-                0
-            } else {
-                ((end_off - 1) / chunk_size as u64) as u32
-            };
-
-            for ci in start_chunk..=end_chunk {
-                let chunk_base = ci as u64 * chunk_size as u64;
-                let chunk = chunks.entry(ci).or_insert_with(|| vec![0u8; chunk_size]);
-
-                let data_start_in_chunk = if off > chunk_base {
-                    (off - chunk_base) as usize
-                } else {
-                    0
-                };
-                let data_off = if chunk_base > off {
-                    (chunk_base - off) as usize
-                } else {
-                    0
-                };
-                let copy_len =
-                    std::cmp::min(data.len() - data_off, chunk_size - data_start_in_chunk);
-
-                chunk[data_start_in_chunk..data_start_in_chunk + copy_len]
-                    .copy_from_slice(&data[data_off..data_off + copy_len]);
+        // Compute the byte range covered by this write buffer.
+        // We build a flat contiguous Vec<u8> and apply writes in order
+        // (later writes at the same offset naturally overwrite earlier ones).
+        let mut min_off = u64::MAX;
+        let mut max_end: u64 = 0;
+        for (off, data) in &write_buf {
+            if *off < min_off {
+                min_off = *off;
+            }
+            let end = *off + data.len() as u64;
+            if end > max_end {
+                max_end = end;
             }
         }
 
-        // Compute actual file size from writes
-        let mut max_offset: u64 = meta.size;
-        for (&off, data) in &write_buf {
-            let end = off + data.len() as u64;
-            if end > max_offset {
-                max_offset = end;
-            }
+        // max_offset = actual file size after this flush
+        let max_offset = std::cmp::max(meta.size, max_end);
+
+        // Build a flat buffer spanning [min_off..max_end), zero-initialized.
+        // Then overlay each write operation in order.
+        let buf_len = (max_end - min_off) as usize;
+        let mut flat_buf = vec![0u8; buf_len];
+        for (off, data) in &write_buf {
+            let start = (*off - min_off) as usize;
+            flat_buf[start..start + data.len()].copy_from_slice(data);
         }
 
-        // Write each chunk to the appropriate OST
+        debug!(
+            "flush_writes: ino={ino:#x} pending={pending} meta.path={} \
+             writes={} bytes=[{min_off}..{max_end}) max_offset={max_offset} \
+             magic={:02x?}",
+            meta.path,
+            write_buf.len(),
+            &flat_buf[..std::cmp::min(4, flat_buf.len())],
+        );
+
+        // Determine which chunks are touched by the write range [min_off..max_end)
+        let first_chunk = (min_off / chunk_size as u64) as u32;
+        let last_chunk = if max_end == 0 {
+            0
+        } else {
+            ((max_end - 1) / chunk_size as u64) as u32
+        };
+
+        let layout_clone = layout.clone();
+        let config_clone = config.clone();
+
+        // Write each affected chunk to the appropriate OST
         self.rt.block_on(async {
             let mut write_handles = Vec::new();
 
-            for (chunk_idx, data) in &chunks {
-                let object_id = StripeLayout::object_id(ino, *chunk_idx);
-                let ost_index = layout.ost_for_chunk(*chunk_idx);
-                let addr = ost_addr(&config, ost_index).map_err(rustre_err_to_errno)?;
+            for chunk_idx in first_chunk..=last_chunk {
+                let chunk_file_start = chunk_idx as u64 * chunk_size as u64;
+                let chunk_file_end = chunk_file_start + chunk_size as u64;
 
-                // Trim trailing zeros for the last chunk
-                let actual_size = if (*chunk_idx as u64 + 1) * chunk_size as u64 > max_offset {
-                    (max_offset - *chunk_idx as u64 * chunk_size as u64) as usize
-                } else {
-                    chunk_size
-                };
-                let data_to_write = data[..actual_size].to_vec();
+                // The actual byte range of this chunk within the file
+                let actual_chunk_end = std::cmp::min(chunk_file_end, max_offset);
+                let actual_chunk_size = (actual_chunk_end - chunk_file_start) as usize;
+
+                // Build the chunk data
+                let mut chunk_data = vec![0u8; actual_chunk_size];
+
+                // Copy the written bytes that fall into this chunk
+                let write_start_in_file = std::cmp::max(chunk_file_start, min_off);
+                let write_end_in_file = std::cmp::min(chunk_file_end, max_end);
+
+                if write_start_in_file < write_end_in_file {
+                    let dst_start = (write_start_in_file - chunk_file_start) as usize;
+                    let dst_end = (write_end_in_file - chunk_file_start) as usize;
+                    let src_start = (write_start_in_file - min_off) as usize;
+                    let src_end = (write_end_in_file - min_off) as usize;
+                    chunk_data[dst_start..dst_end]
+                        .copy_from_slice(&flat_buf[src_start..src_end]);
+                }
+
+                // If this chunk is only partially written and the file already had data
+                // at this offset, we need to read-merge with existing OST data so we
+                // don't zero out bytes we didn't touch.
+                let chunk_fully_covered =
+                    min_off <= chunk_file_start && max_end >= actual_chunk_end;
+                if !chunk_fully_covered && meta.size > chunk_file_start {
+                    let object_id = StripeLayout::object_id(ino, chunk_idx);
+                    let ost_index = layout_clone.ost_for_chunk(chunk_idx);
+                    let addr =
+                        ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
+                    if let Ok(existing) = read_chunk_from_ost(&addr, &object_id).await {
+                        if !existing.is_empty() {
+                            // Merge: fill in only the bytes NOT covered by our write
+                            for i in 0..std::cmp::min(existing.len(), actual_chunk_size) {
+                                let file_off = chunk_file_start + i as u64;
+                                if file_off < min_off || file_off >= max_end {
+                                    // This byte is outside our write range — keep existing
+                                    chunk_data[i] = existing[i];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let object_id = StripeLayout::object_id(ino, chunk_idx);
+                let ost_index = layout_clone.ost_for_chunk(chunk_idx);
+                let addr = ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
                 let addr = addr.clone();
 
                 write_handles.push(tokio::spawn(async move {
-                    write_chunk_to_ost(&addr, &object_id, &data_to_write).await
+                    write_chunk_to_ost(&addr, &object_id, &chunk_data).await
                 }));
             }
 
@@ -492,22 +636,29 @@ impl RustreFs {
                     .map_err(|_| Errno::EIO)?;
             }
 
-            // Commit: set size and make visible
+            // Update MDS metadata:
+            // - For pending files (new via create()): CommitCreate to set size + make visible
+            // - For existing files (opened via open()): SetSize to update size
             let mds = self.pick_mds()?;
-            let reply = rpc_call(
-                &mds,
+            let rpc_kind = if pending {
                 RpcKind::CommitCreate {
                     ino,
                     size: max_offset,
-                },
-            )
-            .await
-            .map_err(rustre_err_to_errno)?;
+                }
+            } else {
+                RpcKind::SetSize {
+                    path: meta.path.clone(),
+                    size: max_offset,
+                }
+            };
+            let reply = rpc_call(&mds, rpc_kind)
+                .await
+                .map_err(rustre_err_to_errno)?;
 
             match reply.kind {
                 RpcKind::Ok => {}
                 RpcKind::Error(e) => {
-                    error!("commit failed: {e}");
+                    error!("MDS size update failed: {e}");
                     return Err(Errno::EIO);
                 }
                 _ => return Err(Errno::EIO),
@@ -517,20 +668,18 @@ impl RustreFs {
         })?;
 
         // Update cached metadata
-        {
-            let mut files = self.open_files.write().map_err(|_| Errno::EIO)?;
-            if let Some(file) = files.get_mut(&fh) {
-                file.meta.size = max_offset;
-                file.meta.pending = false;
-                file.pending = false;
+        if let Some(mut file_ref) = self.open_files.get_mut(&fh) {
+            file_ref.meta.size = max_offset;
+            file_ref.size_dirty = false;
+            if pending {
+                file_ref.meta.pending = false;
+                file_ref.pending = false;
             }
+            file_ref.tracked_size.store(max_offset, Ordering::Relaxed);
         }
-        {
-            let mut inodes = self.inodes.write().map_err(|_| Errno::EIO)?;
-            if let Some(entry) = inodes.entries.get_mut(&ino) {
-                entry.meta.size = max_offset;
-                entry.meta.pending = false;
-            }
+        self.inodes.update_size(ino, max_offset);
+        if pending {
+            self.inodes.update_pending(ino, false);
         }
 
         Ok(())
@@ -614,7 +763,28 @@ async fn write_chunk_to_ost(addr: &str, object_id: &str, data: &[u8]) -> Result<
 // ---------------------------------------------------------------------------
 
 impl Filesystem for RustreFs {
-    /// Rename a file.
+    // -- init: called when the filesystem is mounted --
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
+        // If the kernel supports mmap on direct-IO files, opt in. We return
+        // FOPEN_DIRECT_IO only for writable handles to avoid macFUSE buffered-write
+        // corruption, and this keeps mmap-based writers working when supported.
+        let _ = config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
+
+        info!("RustreFs: FUSE filesystem initialized");
+        Ok(())
+    }
+
+    // -- access: check file accessibility --
+    fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        // Check if inode exists in cache
+        if self.inodes.get_meta(ino.0).is_some() {
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    // -- rename --
     fn rename(
         &self,
         _req: &Request,
@@ -625,7 +795,6 @@ impl Filesystem for RustreFs {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // Build old and new paths
         let old_path = match self.child_path(parent.0, name) {
             Ok(p) => p,
             Err(e) => return reply.error(e),
@@ -635,9 +804,12 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        // Call MDS rename RPC
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
         let result = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let reply = rpc_call(
                 &mds,
                 RpcKind::Rename {
@@ -671,20 +843,14 @@ impl Filesystem for RustreFs {
         match result {
             Ok(()) => {
                 // Update cache: remove old path, add new path
-                if let Ok(mut inodes) = self.inodes.write() {
-                    // Get the ino from old path
-                    if let Some(ino) = inodes.path_to_ino.get(&old_path).copied() {
-                        // Remove old path mapping
-                        inodes.path_to_ino.remove(&old_path);
-                        // Add new path mapping
-                        inodes.path_to_ino.insert(new_path.clone(), ino);
-                        // Update metadata in cache if present
-                        if let Some(entry) = inodes.entries.get_mut(&ino) {
-                            entry.meta.path = new_path;
-                            entry.meta.name = newname.to_str().unwrap_or("").to_string();
-                            entry.meta.parent_ino = newparent.0;
-                            entry.meta.mtime = FileMeta::now_secs();
-                        }
+                if let Some(ino) = self.inodes.path_to_ino.get(&old_path).map(|r| *r.value()) {
+                    self.inodes.path_to_ino.remove(&old_path);
+                    self.inodes.path_to_ino.insert(new_path.clone(), ino);
+                    if let Some(mut entry) = self.inodes.entries.get_mut(&ino) {
+                        entry.path = new_path;
+                        entry.name = newname.to_str().unwrap_or("").to_string();
+                        entry.parent_ino = newparent.0;
+                        entry.mtime = FileMeta::now_secs();
                     }
                 }
                 reply.ok();
@@ -703,10 +869,7 @@ impl Filesystem for RustreFs {
         match self.stat_path(&path) {
             Ok(meta) => {
                 let attr = meta_to_attr(&meta);
-                // Cache the inode
-                if let Ok(mut inodes) = self.inodes.write() {
-                    inodes.insert(meta);
-                }
+                self.inodes.insert(meta);
                 reply.entry(&ENTRY_TTL, &attr, Generation(0));
             }
             Err(e) => reply.error(e),
@@ -714,24 +877,30 @@ impl Filesystem for RustreFs {
     }
 
     // -- getattr: get file attributes by ino --
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        // Try cache first
-        {
-            let inodes = match self.inodes.read() {
-                Ok(i) => i,
-                Err(_) => return reply.error(Errno::EIO),
-            };
-            if let Some(meta) = inodes.get(ino.0) {
-                return reply.attr(&ATTR_TTL, &meta_to_attr(meta));
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        // If we have a file handle, check if the open file has a more up-to-date size
+        if let Some(fh_val) = fh {
+            if let Some(file_ref) = self.open_files.get(&fh_val.0) {
+                let file = file_ref.value();
+                let mut meta = file.meta.clone();
+                let tracked = file.tracked_size.load(Ordering::Relaxed);
+                if tracked > meta.size {
+                    meta.size = tracked;
+                }
+                return reply.attr(&ATTR_TTL, &meta_to_attr(&meta));
             }
         }
 
-        // Cache miss — need to ask MDS, but we need the path
-        // For unknown inodes, return ENOENT (they'll get cached via lookup)
+        // Try inode cache
+        if let Some(meta) = self.inodes.get_meta(ino.0) {
+            return reply.attr(&ATTR_TTL, &meta_to_attr(&meta));
+        }
+
+        // Cache miss — for unknown inodes, return ENOENT (they'll get cached via lookup)
         reply.error(Errno::ENOENT);
     }
 
-    // -- setattr: handle truncate (size changes) --
+    // -- setattr: handle truncate, mode, timestamps --
     fn setattr(
         &self,
         _req: &Request,
@@ -743,7 +912,7 @@ impl Filesystem for RustreFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -754,57 +923,113 @@ impl Filesystem for RustreFs {
 
         // Handle truncate
         if let Some(new_size) = size {
-            let path = {
-                let inodes = match self.inodes.read() {
-                    Ok(i) => i,
-                    Err(_) => return reply.error(Errno::EIO),
-                };
-                match inodes.get_path(ino_val) {
-                    Some(p) => p.to_string(),
-                    None => return reply.error(Errno::ENOENT),
-                }
-            };
-
-            let result = self.rt.block_on(async {
-                let mds = self.pick_mds()?;
-                let rpc_reply = rpc_call(
-                    &mds,
-                    RpcKind::SetSize {
-                        path: path.clone(),
-                        size: new_size,
-                    },
-                )
-                .await
-                .map_err(rustre_err_to_errno)?;
-                match rpc_reply.kind {
-                    RpcKind::Ok => Ok(()),
-                    RpcKind::Error(e) => {
-                        error!("setsize failed: {e}");
-                        Err(Errno::EIO)
-                    }
-                    _ => Err(Errno::EIO),
-                }
+            // First try explicit file handle
+            let maybe_fh = fh.and_then(|fh_val| {
+                self.open_files.get(&fh_val.0).map(|_| fh_val.0)
             });
 
-            if let Err(e) = result {
-                return reply.error(e);
-            }
+            // If no fh provided (or fh not found), search by ino
+            let effective_fh = maybe_fh.or_else(|| {
+                self.open_files.iter().find_map(|entry| {
+                    if entry.value().ino == ino_val {
+                        Some(*entry.key())
+                    } else {
+                        None
+                    }
+                })
+            });
 
-            // Update cache
-            if let Ok(mut inodes) = self.inodes.write() {
-                if let Some(entry) = inodes.entries.get_mut(&ino_val) {
-                    entry.meta.size = new_size;
+            // Check if the open file is pending (created via create(), not yet committed).
+            // Pending files should NEVER call MDS SetSize — their final size is set
+            // atomically by CommitCreate when flush_writes runs.
+            //
+            // This handles three patterns:
+            //   1. Finder:  create() → write() → setattr(size=0) → flush()
+            //   2. Linker:  create() → setattr(size=N) → write() → flush()
+            //   3. O_TRUNC: open() → setattr(size=0) → write() → flush()
+            //
+            // Cases 1 & 2: file.pending=true → local-only update
+            // Case 3:       file.pending=false → must call MDS SetSize
+            let is_pending = effective_fh
+                .and_then(|fh_val| self.open_files.get(&fh_val))
+                .map(|file_ref| file_ref.value().pending)
+                .unwrap_or(false);
+
+            debug!(
+                "setattr: ino={ino_val:#x} size={new_size} fh={fh:?} \
+                 effective_fh={effective_fh:?} is_pending={is_pending}",
+            );
+
+            if is_pending {
+                // Pending file: just update local state.
+                // flush_writes → CommitCreate will set the final size on MDS.
+                if let Some(fh_val) = effective_fh {
+                    if let Some(mut file_ref) = self.open_files.get_mut(&fh_val) {
+                        let file = file_ref.value_mut();
+                        file.tracked_size.store(new_size, Ordering::Relaxed);
+                        file.meta.size = new_size;
+                    }
                 }
+                self.inodes.update_size(ino_val, new_size);
+            } else {
+                // Committed file (O_TRUNC, normal truncate, etc.):
+                // must call MDS to actually truncate/resize.
+                if let Some(fh_val) = effective_fh {
+                    if let Some(mut file_ref) = self.open_files.get_mut(&fh_val) {
+                        let file = file_ref.value_mut();
+                        file.tracked_size.store(new_size, Ordering::Relaxed);
+                        file.meta.size = new_size;
+                    }
+                }
+                self.inodes.update_size(ino_val, new_size);
+                let path = match self.inodes.get_path(ino_val) {
+                    Some(p) => p,
+                    None => return reply.error(Errno::ENOENT),
+                };
+
+                let mds = match self.pick_mds() {
+                    Ok(m) => m,
+                    Err(e) => return reply.error(e),
+                };
+
+                let result = self.rt.block_on(async {
+                    let rpc_reply = rpc_call(
+                        &mds,
+                        RpcKind::SetSize {
+                            path: path.clone(),
+                            size: new_size,
+                        },
+                    )
+                    .await
+                    .map_err(rustre_err_to_errno)?;
+                    match rpc_reply.kind {
+                        RpcKind::Ok => Ok(()),
+                        RpcKind::Error(e) => {
+                            error!("setsize failed: {e}");
+                            Err(Errno::EIO)
+                        }
+                        _ => Err(Errno::EIO),
+                    }
+                });
+
+                if let Err(e) = result {
+                    return reply.error(e);
+                }
+
+                if let Some(fh_val) = effective_fh {
+                    if let Some(mut file_ref) = self.open_files.get_mut(&fh_val) {
+                        file_ref.size_dirty = false;
+                    }
+                }
+
+                // Update cache (redundant but harmless)
+                self.inodes.update_size(ino_val, new_size);
             }
         }
 
         // Return current attributes
-        let inodes = match self.inodes.read() {
-            Ok(i) => i,
-            Err(_) => return reply.error(Errno::EIO),
-        };
-        match inodes.get(ino_val) {
-            Some(meta) => reply.attr(&ATTR_TTL, &meta_to_attr(meta)),
+        match self.inodes.get_meta(ino_val) {
+            Some(meta) => reply.attr(&ATTR_TTL, &meta_to_attr(&meta)),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -819,19 +1044,17 @@ impl Filesystem for RustreFs {
         mut reply: ReplyDirectory,
     ) {
         let ino_val = ino.0;
-        let path = {
-            let inodes = match self.inodes.read() {
-                Ok(i) => i,
-                Err(_) => return reply.error(Errno::EIO),
-            };
-            match inodes.get_path(ino_val) {
-                Some(p) => p.to_string(),
-                None => return reply.error(Errno::ENOENT),
-            }
+        let path = match self.inodes.get_path(ino_val) {
+            Some(p) => p,
+            None => return reply.error(Errno::ENOENT),
+        };
+
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
         };
 
         let entries = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let rpc_reply = rpc_call(&mds, RpcKind::Readdir(path.clone()))
                 .await
                 .map_err(rustre_err_to_errno)?;
@@ -856,10 +1079,11 @@ impl Filesystem for RustreFs {
         };
 
         // Build directory listing: . and .. first, then children
-        let parent_ino = {
-            let inodes = self.inodes.read().unwrap_or_else(|e| e.into_inner());
-            inodes.get(ino_val).map(|m| m.parent_ino).unwrap_or(1)
-        };
+        let parent_ino = self
+            .inodes
+            .get_meta(ino_val)
+            .map(|m| m.parent_ino)
+            .unwrap_or(1);
 
         let mut all_entries: Vec<(INodeNo, FileType, String)> = Vec::new();
         all_entries.push((INodeNo(ino_val), FileType::Directory, ".".to_string()));
@@ -870,11 +1094,8 @@ impl Filesystem for RustreFs {
         ));
 
         // Cache children and build entries
-        {
-            let mut inodes = self.inodes.write().unwrap_or_else(|e| e.into_inner());
-            for child in &entries {
-                inodes.insert(child.clone());
-            }
+        for child in &entries {
+            self.inodes.insert(child.clone());
         }
 
         for entry in &entries {
@@ -888,13 +1109,45 @@ impl Filesystem for RustreFs {
 
         // Apply offset and fill reply
         for (i, (entry_ino, kind, name)) in all_entries.iter().enumerate().skip(offset as usize) {
-            // offset is 1-based for non-zero entries
             let next_offset = (i + 1) as u64;
             if reply.add(*entry_ino, next_offset, *kind, name) {
                 break; // buffer full
             }
         }
 
+        reply.ok();
+    }
+
+    // -- opendir/releasedir/fsyncdir --
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.inodes.get_meta(ino.0).is_some() {
+            let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Directories don't need syncing in our architecture (MDS uses FDB transactions)
         reply.ok();
     }
 
@@ -913,8 +1166,12 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
         let result = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let rpc_reply = rpc_call(&mds, RpcKind::Mkdir(path.clone()))
                 .await
                 .map_err(rustre_err_to_errno)?;
@@ -941,9 +1198,7 @@ impl Filesystem for RustreFs {
         match self.stat_path(&path) {
             Ok(meta) => {
                 let attr = meta_to_attr(&meta);
-                if let Ok(mut inodes) = self.inodes.write() {
-                    inodes.insert(meta);
-                }
+                self.inodes.insert(meta);
                 reply.entry(&ENTRY_TTL, &attr, Generation(0));
             }
             Err(e) => reply.error(e),
@@ -965,14 +1220,15 @@ impl Filesystem for RustreFs {
 
         let ino = meta.ino;
         let has_objects = meta.layout.is_some();
-        let config = match self.get_cached_config() {
-            Ok(c) => c,
+        let config = self.snap_config();
+
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
             Err(e) => return reply.error(e),
         };
 
         // MDS unlink first (same protocol as client/rm.rs)
         let result = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let rpc_reply = rpc_call(&mds, RpcKind::Unlink(path.clone()))
                 .await
                 .map_err(rustre_err_to_errno)?;
@@ -993,7 +1249,7 @@ impl Filesystem for RustreFs {
             return reply.error(e);
         }
 
-        // Best-effort OSS cleanup (same as client/rm.rs)
+        // Best-effort OSS cleanup
         if has_objects {
             self.rt.block_on(async {
                 let mut futures = Vec::new();
@@ -1008,10 +1264,7 @@ impl Filesystem for RustreFs {
         }
 
         // Remove from cache
-        if let Ok(mut inodes) = self.inodes.write() {
-            inodes.remove(ino);
-        }
-
+        self.inodes.remove(ino);
         reply.ok();
     }
 
@@ -1022,8 +1275,12 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
         let result = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let rpc_reply = rpc_call(&mds, RpcKind::Unlink(path.clone()))
                 .await
                 .map_err(rustre_err_to_errno)?;
@@ -1044,15 +1301,8 @@ impl Filesystem for RustreFs {
 
         match result {
             Ok(()) => {
-                // Remove from cache
-                let ino = {
-                    let inodes = self.inodes.read().unwrap_or_else(|e| e.into_inner());
-                    inodes.path_to_ino.get(&path).copied()
-                };
-                if let Some(ino) = ino {
-                    if let Ok(mut inodes) = self.inodes.write() {
-                        inodes.remove(ino);
-                    }
+                if let Some(ino) = self.inodes.path_to_ino.get(&path).map(|r| *r.value()) {
+                    self.inodes.remove(ino);
                 }
                 reply.ok();
             }
@@ -1063,39 +1313,79 @@ impl Filesystem for RustreFs {
     // -- open: open a file, return a file handle --
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino_val = ino.0;
-        let meta = {
-            let inodes = match self.inodes.read() {
-                Ok(i) => i,
-                Err(_) => return reply.error(Errno::EIO),
-            };
-            match inodes.get(ino_val) {
-                Some(m) => m.clone(),
-                None => {
-                    // Try to fetch from MDS if not cached
-                    drop(inodes);
-                    // We don't have the path, so we can't stat
-                    return reply.error(Errno::ENOENT);
-                }
+        let mut meta = match self.inodes.get_meta(ino_val) {
+            Some(m) => m,
+            None => {
+                return reply.error(Errno::ENOENT);
             }
         };
 
         let raw_flags = flags.0;
         let writable = (raw_flags & libc::O_WRONLY != 0) || (raw_flags & libc::O_RDWR != 0);
+        let truncate = raw_flags & libc::O_TRUNC != 0;
+
+        // Handle O_TRUNC: truncate the file to zero length
+        if truncate && writable && meta.size > 0 {
+            let mds = match self.pick_mds() {
+                Ok(m) => m,
+                Err(e) => return reply.error(e),
+            };
+            let path = meta.path.clone();
+            let result = self.rt.block_on(async {
+                let rpc_reply = rpc_call(
+                    &mds,
+                    RpcKind::SetSize {
+                        path,
+                        size: 0,
+                    },
+                )
+                .await
+                .map_err(rustre_err_to_errno)?;
+                match rpc_reply.kind {
+                    RpcKind::Ok => Ok(()),
+                    RpcKind::Error(e) => {
+                        error!("truncate failed: {e}");
+                        Err(Errno::EIO)
+                    }
+                    _ => Err(Errno::EIO),
+                }
+            });
+            if let Err(e) = result {
+                return reply.error(e);
+            }
+            meta.size = 0;
+            self.inodes.update_size(ino_val, 0);
+        }
+
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            "open: ino={ino_val:#x} fh={fh} flags={raw_flags:#x} writable={writable} \
+             truncate={truncate} meta.size={} path={}",
+            meta.size, meta.path,
+        );
 
         let open_file = OpenFile {
             ino: ino_val,
+            tracked_size: AtomicU64::new(meta.size),
             meta,
-            write_buf: HashMap::new(),
+            write_buf: Mutex::new(Vec::new()),
             writable,
             pending: false,
+            size_dirty: false,
         };
 
-        if let Ok(mut files) = self.open_files.write() {
-            files.insert(fh, open_file);
-        }
+        self.open_files.insert(fh, open_file);
 
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        // macFUSE buffered writes on writable handles can corrupt linker/rustc outputs
+        // (replayed/overlapping writes with stale zero pages). Force direct I/O for
+        // writable handles so each write request carries the real userspace buffer.
+        // Keep read-only handles cached so exec/mmap of finished outputs still works.
+        let mut open_flags = FopenFlags::empty();
+        if writable {
+            open_flags |= FopenFlags::FOPEN_DIRECT_IO;
+        }
+        reply.opened(FileHandle(fh), open_flags);
     }
 
     // -- read: read file data --
@@ -1113,25 +1403,28 @@ impl Filesystem for RustreFs {
         let ino_val = ino.0;
         let fh_val = fh.0;
 
-        // Get metadata from open file handle or cache
-        let meta = {
-            let files = match self.open_files.read() {
-                Ok(f) => f,
-                Err(_) => return reply.error(Errno::EIO),
-            };
-            if let Some(file) = files.get(&fh_val) {
-                file.meta.clone()
-            } else {
-                drop(files);
-                let inodes = match self.inodes.read() {
-                    Ok(i) => i,
-                    Err(_) => return reply.error(Errno::EIO),
-                };
-                match inodes.get(ino_val) {
-                    Some(m) => m.clone(),
-                    None => return reply.error(Errno::ENOENT),
-                }
+        // If this fd has buffered writes, flush them first to ensure read-after-write
+        // consistency (e.g., build scripts that write then read the same file).
+        if let Some(file_ref) = self.open_files.get(&fh_val) {
+            let has_buffered = !file_ref.write_buf.lock().is_empty();
+            drop(file_ref);
+            if has_buffered {
+                let _ = self.flush_writes(fh_val);
             }
+        }
+
+        // Get metadata from open file handle or inode cache
+        let meta = if let Some(file_ref) = self.open_files.get(&fh_val) {
+            let mut m = file_ref.meta.clone();
+            let tracked = file_ref.tracked_size.load(Ordering::Relaxed);
+            if tracked > m.size {
+                m.size = tracked;
+            }
+            m
+        } else if let Some(m) = self.inodes.get_meta(ino_val) {
+            m
+        } else {
+            return reply.error(Errno::ENOENT);
         };
 
         if meta.is_dir {
@@ -1160,9 +1453,13 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        // Create pending file on MDS (same as client/put.rs phase 1)
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
+        // Create pending file on MDS
         let meta = self.rt.block_on(async {
-            let mds = self.pick_mds()?;
             let rpc_reply = rpc_call(
                 &mds,
                 RpcKind::Create(CreateReq {
@@ -1199,33 +1496,36 @@ impl Filesystem for RustreFs {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
         // Cache the inode
-        if let Ok(mut inodes) = self.inodes.write() {
-            inodes.insert(meta.clone());
-        }
+        self.inodes.insert(meta.clone());
 
         // Create open file handle
         let open_file = OpenFile {
             ino,
+            tracked_size: AtomicU64::new(0),
             meta,
-            write_buf: HashMap::new(),
+            write_buf: Mutex::new(Vec::new()),
             writable: true,
             pending: true, // Will be committed on flush/release
+            size_dirty: false,
         };
 
-        if let Ok(mut files) = self.open_files.write() {
-            files.insert(fh, open_file);
-        }
+        self.open_files.insert(fh, open_file);
 
+        debug!("create: ino={ino:#x} fh={fh} path={}", attr.ino);
+
+        // Same rationale as open(): force direct I/O for newly created writable files
+        // so compiler/linker outputs don't go through macFUSE's problematic buffered
+        // write path.
         reply.created(
             &ENTRY_TTL,
             &attr,
             Generation(0),
             FileHandle(fh),
-            FopenFlags::empty(),
+            FopenFlags::FOPEN_DIRECT_IO,
         );
     }
 
-    // -- write: buffer write data --
+    // -- write: write through to OSS so in-flight outputs are readable/patchable --
     fn write(
         &self,
         _req: &Request,
@@ -1239,27 +1539,38 @@ impl Filesystem for RustreFs {
         reply: ReplyWrite,
     ) {
         let fh_val = fh.0;
-        let mut files = match self.open_files.write() {
-            Ok(f) => f,
-            Err(_) => return reply.error(Errno::EIO),
-        };
-        let file = match files.get_mut(&fh_val) {
-            Some(f) => f,
+        let (ino, meta, pending, current_size) = match self.open_files.get(&fh_val) {
+            Some(file_ref) => {
+                let file = file_ref.value();
+                if !file.writable {
+                    return reply.error(Errno::EBADF);
+                }
+                (
+                    file.ino,
+                    file.meta.clone(),
+                    file.pending,
+                    std::cmp::max(file.meta.size, file.tracked_size.load(Ordering::Relaxed)),
+                )
+            }
             None => return reply.error(Errno::EBADF),
         };
 
-        if !file.writable {
-            return reply.error(Errno::EBADF);
-        }
-
-        // Buffer the write data
-        file.write_buf.insert(offset, data.to_vec());
-
-        // Update file size in our tracking
         let new_end = offset + data.len() as u64;
-        if new_end > file.meta.size {
-            file.meta.size = new_end;
+        let logical_size = std::cmp::max(current_size, new_end);
+
+        if let Err(e) = self.write_through(ino, &meta, logical_size, offset, data) {
+            return reply.error(e);
         }
+
+        if let Some(mut file_ref) = self.open_files.get_mut(&fh_val) {
+            let file = file_ref.value_mut();
+            file.tracked_size.store(logical_size, Ordering::Relaxed);
+            file.meta.size = logical_size;
+            if !pending && logical_size != meta.size {
+                file.size_dirty = true;
+            }
+        }
+        self.inodes.update_size(ino, logical_size);
 
         reply.written(data.len() as u32);
     }
@@ -1273,6 +1584,23 @@ impl Filesystem for RustreFs {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        debug!("flush: fh={}", fh.0);
+        match self.flush_writes(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    // -- fsync: ensure data is persisted to disk --
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Same as flush — write all buffered data to OSTs
         match self.flush_writes(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1291,23 +1619,211 @@ impl Filesystem for RustreFs {
         reply: ReplyEmpty,
     ) {
         let fh_val = fh.0;
+        debug!("release: fh={fh_val}");
         // Flush any remaining writes
         let _ = self.flush_writes(fh_val);
 
         // Remove the file handle
-        if let Ok(mut files) = self.open_files.write() {
-            files.remove(&fh_val);
+        self.open_files.remove(&fh_val);
+        reply.ok();
+    }
+
+    // -- link: create a hard link --
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let new_path = match self.child_path(newparent.0, newname) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
+        let result = self.rt.block_on(async {
+            let rpc_reply = rpc_call(
+                &mds,
+                RpcKind::Link {
+                    ino: ino.0,
+                    new_path: new_path.clone(),
+                },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
+            match rpc_reply.kind {
+                RpcKind::MetaReply(m) => Ok(m),
+                RpcKind::Error(e) => {
+                    if e.contains("not found") {
+                        Err(Errno::ENOENT)
+                    } else if e.contains("already exists") {
+                        Err(Errno::EEXIST)
+                    } else if e.contains("invalid argument") || e.contains("cannot hard-link") {
+                        Err(Errno::EPERM)
+                    } else {
+                        Err(Errno::EIO)
+                    }
+                }
+                _ => Err(Errno::EIO),
+            }
+        });
+
+        match result {
+            Ok(meta) => {
+                let attr = meta_to_attr(&meta);
+                self.inodes.insert(meta);
+                reply.entry(&ENTRY_TTL, &attr, Generation(0));
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    // -- copy_file_range: server-side copy between two open files --
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        // Read from source
+        let src_meta = if let Some(file_ref) = self.open_files.get(&fh_in.0) {
+            let mut m = file_ref.meta.clone();
+            let tracked = file_ref.tracked_size.load(Ordering::Relaxed);
+            if tracked > m.size {
+                m.size = tracked;
+            }
+            m
+        } else if let Some(m) = self.inodes.get_meta(ino_in.0) {
+            m
+        } else {
+            return reply.error(Errno::ENOENT);
+        };
+
+        let actual_len = std::cmp::min(len, src_meta.size.saturating_sub(offset_in));
+        if actual_len == 0 {
+            return reply.written(0);
         }
 
+        // Read source data
+        let data = match self.read_data(&src_meta, offset_in, actual_len as u32) {
+            Ok(d) => d,
+            Err(e) => return reply.error(e),
+        };
+
+        // Write to destination
+        let dest_file = match self.open_files.get(&fh_out.0) {
+            Some(f) => f,
+            None => return reply.error(Errno::EBADF),
+        };
+
+        if !dest_file.writable {
+            return reply.error(Errno::EBADF);
+        }
+
+        {
+            let mut wb = dest_file.write_buf.lock();
+            wb.push((offset_out, data.clone()));
+        }
+
+        // Update tracked size
+        let new_end = offset_out + data.len() as u64;
+        loop {
+            let current = dest_file.tracked_size.load(Ordering::Relaxed);
+            if new_end <= current {
+                break;
+            }
+            if dest_file
+                .tracked_size
+                .compare_exchange_weak(current, new_end, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let _ = ino_out; // Used implicitly through fh_out
+        reply.written(data.len() as u32);
+    }
+
+    // -- ioctl: catch-all for ioctls (return not supported) --
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOTTY);
+    }
+
+    // -- xattr operations: macOS Finder relies on these heavily --
+    // We don't actually store xattrs, but we need to respond correctly
+    // so Finder doesn't hang or error out.
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: fuser::ReplyXattr) {
+        // No extended attributes — return empty list
+        reply.size(0);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        // Attribute not found — NO_XATTR is the portable alias
+        // (ENODATA on Linux, ENOATTR on macOS)
+        reply.error(Errno::NO_XATTR);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // Silently accept (pretend we stored it) — this prevents Finder errors
+        // when it tries to set com.apple.quarantine etc.
+        reply.ok();
+    }
+
+    fn removexattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        // Silently succeed — same rationale as setxattr
         reply.ok();
     }
 
     // -- statfs: filesystem statistics --
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let config = match self.get_cached_config() {
-            Ok(c) => c,
-            Err(e) => return reply.error(e),
-        };
+        let config = self.snap_config();
 
         let mut total_bytes: u64 = 0;
         let mut used_bytes: u64 = 0;

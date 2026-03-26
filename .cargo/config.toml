@@ -2,4 +2,4 @@
 # Install FDB: https://github.com/apple/foundationdb/releases
 # On macOS ARM64, extract the FoundationDB-*_arm64.pkg client package.
 [build]
-rustflags = ["-L", "/usr/local/lib"]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib", "-L", "/usr/local/lib"]

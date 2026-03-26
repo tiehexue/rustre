@@ -31,6 +31,8 @@ foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_1"
 
 [target.'cfg(unix)'.dependencies]
 fuser = { version = "0.17", optional = true }
+parking_lot = "0.12"
+dashmap = "6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }

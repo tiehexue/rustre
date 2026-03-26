@@ -117,6 +117,13 @@ pub struct FileMeta {
     /// garbage-collected if never committed (client crash recovery).
     #[serde(default)]
     pub pending: bool,
+    /// Hard link count. Defaults to 1 for backward compatibility.
+    #[serde(default = "default_nlink")]
+    pub nlink: u32,
+}
+
+fn default_nlink() -> u32 {
+    1
 }
 
 impl FileMeta {
