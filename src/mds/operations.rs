@@ -332,6 +332,7 @@ pub async fn handle_create(
         // Mark as pending — invisible to lookups until CommitCreate.
         // This prevents readers from seeing a file whose data is still being written.
         pending: true,
+        nlink: 1,
     };
 
     // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
@@ -379,6 +380,7 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> 
         layout: None,
         parent_ino,
         pending: false,
+        nlink: 2, // directory: . and parent
     };
 
     // Persist atomically: inode + path + child entry + next_ino
@@ -684,4 +686,59 @@ pub async fn handle_rename(
 
     info!("MDS: renamed {old_path} -> {new_path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Handle hard link operation
+pub async fn handle_link(
+    req_id: u64,
+    ino: u64,
+    new_path: &str,
+    state: &RwLock<MdsState>,
+) -> Result<RpcMessage> {
+    let new_path = path_utils::normalize_path(new_path);
+    let new_parent = path_utils::parent_path(&new_path);
+    let _new_name = path_utils::basename(&new_path);
+
+    let st = state.read().await;
+
+    // Get existing inode
+    let mut meta = st
+        .store
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("ino {ino}")))?;
+
+    // Cannot hard-link directories (POSIX rule)
+    if meta.is_dir {
+        return Err(RustreError::InvalidArgument(
+            "cannot hard-link a directory".into(),
+        ));
+    }
+
+    // Cannot link pending files
+    if meta.pending {
+        return Err(RustreError::NotFound(format!("ino {ino} (pending)")));
+    }
+
+    // Check new parent exists
+    let new_parent_ino = st
+        .store
+        .resolve_path(&new_parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {new_parent}")))?;
+
+    // Check target doesn't already exist
+    if (st.store.resolve_path(&new_path).await?).is_some() {
+        return Err(RustreError::AlreadyExists(new_path));
+    }
+
+    // Increment nlink
+    meta.nlink += 1;
+    meta.mtime = FileMeta::now_secs();
+
+    // Atomically: update inode nlink + add new path mapping + add parent-child entry
+    st.store.txn_link(ino, &meta, &new_path, new_parent_ino).await?;
+
+    info!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
+    Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
