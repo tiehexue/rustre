@@ -1591,12 +1591,9 @@ impl Filesystem for RustreFs {
         // SetSize (the normal non-pending path).
         let commit_result = self.rt.block_on(async {
             let mds_addr = self.pick_mds()?;
-            let reply = rpc_call(
-                &mds_addr,
-                RpcKind::CommitCreate { ino, size: 0 },
-            )
-            .await
-            .map_err(rustre_err_to_errno)?;
+            let reply = rpc_call(&mds_addr, RpcKind::CommitCreate { ino, size: 0 })
+                .await
+                .map_err(rustre_err_to_errno)?;
             match reply.kind {
                 RpcKind::Ok => Ok(()),
                 RpcKind::Error(e) => {
@@ -1609,7 +1606,7 @@ impl Filesystem for RustreFs {
 
         if let Err(e) = commit_result {
             // Best-effort abort the pending MDS record
-            let _ = self.rt.block_on(async {
+            self.rt.block_on(async {
                 let mds_addr = self.pick_mds().ok();
                 if let Some(addr) = mds_addr {
                     let _ = rpc_call(&addr, RpcKind::AbortCreate { ino }).await;
@@ -1706,7 +1703,7 @@ impl Filesystem for RustreFs {
         let write_end = offset + data.len() as u64;
 
         // Check if write starts and ends on chunk boundaries
-        let starts_on_boundary = offset % chunk_size == 0;
+        let starts_on_boundary = offset.is_multiple_of(chunk_size);
 
         // Check if write covers at least one full chunk
         let mut covers_full_chunk = false;

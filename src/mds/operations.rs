@@ -462,7 +462,10 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
             .store
             .txn_dec_nlink(ino, &updated, &path, parent_ino)
             .await?;
-        info!("MDS: unlinked {path} ino={ino} (nlink now {})", updated.nlink);
+        info!(
+            "MDS: unlinked {path} ino={ino} (nlink now {})",
+            updated.nlink
+        );
     } else {
         // Last link (or directory): fully remove inode + path + child entry
         state
