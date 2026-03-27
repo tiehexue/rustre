@@ -120,6 +120,9 @@ pub struct FileMeta {
     /// Hard link count. Defaults to 1 for backward compatibility.
     #[serde(default = "default_nlink")]
     pub nlink: u32,
+    /// Symlink target path (None for regular files/directories)
+    #[serde(default)]
+    pub symlink_target: Option<String>,
 }
 
 fn default_nlink() -> u32 {

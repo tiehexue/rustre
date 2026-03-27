@@ -125,6 +125,11 @@ pub enum RpcKind {
         ino: u64,
         new_path: String,
     },
+    /// Create a symbolic link: path → target.
+    Symlink {
+        path: String,
+        target: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

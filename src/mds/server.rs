@@ -87,6 +87,9 @@ async fn handle_connection(
         RpcKind::Link { ino, new_path } => {
             operations::handle_link(msg.id, ino, &new_path, &state).await
         }
+        RpcKind::Symlink { path, target } => {
+            operations::handle_symlink(msg.id, &path, &target, &state).await
+        }
         RpcKind::Heartbeat => {
             // Respond to heartbeat immediately
             Ok(make_reply(msg.id, RpcKind::HeartbeatReply))

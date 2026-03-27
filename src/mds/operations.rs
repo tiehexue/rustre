@@ -333,6 +333,7 @@ pub async fn handle_create(
         // This prevents readers from seeing a file whose data is still being written.
         pending: true,
         nlink: 1,
+        symlink_target: None,
     };
 
     // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
@@ -381,6 +382,7 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> 
         parent_ino,
         pending: false,
         nlink: 2, // directory: . and parent
+        symlink_target: None,
     };
 
     // Persist atomically: inode + path + child entry + next_ino
@@ -742,5 +744,66 @@ pub async fn handle_link(
         .await?;
 
     info!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
+    Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
+}
+
+/// Handle symbolic link operation
+pub async fn handle_symlink(
+    req_id: u64,
+    path: &str,
+    target: &str,
+    state: &RwLock<MdsState>,
+) -> Result<RpcMessage> {
+    let path = path_utils::normalize_path(path);
+    let parent = path_utils::parent_path(&path);
+    let name = path_utils::basename(&path);
+
+    let st = state.read().await;
+
+    // Check parent exists and is a directory
+    let parent_ino = st
+        .store
+        .resolve_path(&parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
+
+    let parent_meta = st
+        .store
+        .get_inode(parent_ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(parent.clone()))?;
+
+    if !parent_meta.is_dir {
+        return Err(RustreError::NotADirectory(parent));
+    }
+
+    // Check if already exists
+    if (st.store.resolve_path(&path).await?).is_some() {
+        return Err(RustreError::AlreadyExists(path));
+    }
+
+    // Allocate inode from local range
+    let ino = st.ino_alloc.alloc().await?;
+
+    let now = FileMeta::now_secs();
+    let meta = FileMeta {
+        ino,
+        name: name.clone(),
+        path: path.clone(),
+        is_dir: false,
+        size: 0,
+        ctime: now,
+        mtime: now,
+        layout: None, // Symlinks have no data on OSS
+        parent_ino,
+        pending: false, // Symlinks are immediately visible
+        nlink: 1,
+        symlink_target: Some(target.to_string()),
+    };
+
+    // Persist atomically: inode + path + child entry
+    st.store.txn_create(&meta, &path, parent_ino).await?;
+
+    info!("MDS: created symlink {path} -> {target} ino={ino}");
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
