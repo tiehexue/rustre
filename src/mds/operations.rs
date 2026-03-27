@@ -423,6 +423,16 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
         ));
     }
 
+    // Resolve the parent of the path being unlinked.  For hard links the
+    // unlinked path may live in a different directory than the inode's
+    // original parent_ino, so we must use the path's actual parent.
+    let parent_path = path_utils::parent_path(&path);
+    let parent_ino = state
+        .store
+        .resolve_path(&parent_path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(parent_path.clone()))?;
+
     let ino = state
         .store
         .resolve_path(&path)
@@ -442,13 +452,25 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
         }
     }
 
-    // Atomically remove: inode + path + parent's child entry (+ children range for dirs)
-    state
-        .store
-        .txn_unlink(ino, &path, meta.parent_ino, meta.is_dir)
-        .await?;
-
-    info!("MDS: unlinked {path} ino={ino}");
+    if !meta.is_dir && meta.nlink > 1 {
+        // Hard-linked file: decrement nlink, remove this path + child entry,
+        // but keep the inode alive for the remaining links.
+        let mut updated = meta;
+        updated.nlink -= 1;
+        updated.mtime = FileMeta::now_secs();
+        state
+            .store
+            .txn_dec_nlink(ino, &updated, &path, parent_ino)
+            .await?;
+        info!("MDS: unlinked {path} ino={ino} (nlink now {})", updated.nlink);
+    } else {
+        // Last link (or directory): fully remove inode + path + child entry
+        state
+            .store
+            .txn_unlink(ino, &path, parent_ino, meta.is_dir)
+            .await?;
+        info!("MDS: unlinked {path} ino={ino}");
+    }
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 

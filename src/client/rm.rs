@@ -34,9 +34,11 @@ pub async fn cmd_rm(mgs_addr: &str, path: &str) -> Result<()> {
 
     let has_objects = meta.layout.is_some();
     let ino = meta.ino;
+    let nlink = meta.nlink;
 
     // Step 2: Unlink from MDS FIRST — the file becomes invisible immediately.
-    // If this fails, we stop — no data has been touched.
+    // If nlink > 1, MDS only decrements nlink and removes one path mapping.
+    // If nlink <= 1, MDS fully removes the inode.
     let reply = rpc_call(&mds, RpcKind::Unlink(path.to_string())).await?;
     match reply.kind {
         RpcKind::Ok => {}
@@ -48,10 +50,9 @@ pub async fn cmd_rm(mgs_addr: &str, path: &str) -> Result<()> {
     }
 
     // Step 3: Delete stripe objects from all OSTs (best-effort).
-    // The MDS record is already gone, so even if some OSTs are unreachable,
-    // the worst case is orphaned objects that waste disk space — never
-    // a phantom file that references deleted data.
-    if has_objects {
+    // Only when this was the last link (nlink <= 1).
+    // If other hard links still reference the same inode, the data must stay.
+    if has_objects && nlink <= 1 {
         let mut delete_futures = Vec::new();
         for ost_info in &config.ost_list {
             let addr = ost_info.address.clone();

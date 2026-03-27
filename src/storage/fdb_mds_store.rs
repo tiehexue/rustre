@@ -279,6 +279,45 @@ impl FdbMdsStore {
         Ok(())
     }
 
+    /// Atomically decrement nlink for a hard-linked file: update inode nlink,
+    /// remove one path mapping and parent-child entry, but KEEP the inode itself.
+    ///
+    /// Used when unlinking a file that still has nlink > 1 after the decrement.
+    pub async fn txn_dec_nlink(
+        &self,
+        ino: u64,
+        meta: &crate::types::FileMeta,
+        path: &str,
+        parent_ino: u64,
+    ) -> Result<()> {
+        let ino_key = self.ino_key(ino);
+        let path_key = self.path_key(path);
+        let child_key = self.child_key(parent_ino, ino);
+
+        let meta_data =
+            bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
+
+        self.db
+            .run(|trx, _| {
+                let ino_key = ino_key.clone();
+                let path_key = path_key.clone();
+                let child_key = child_key.clone();
+                let meta_data = meta_data.clone();
+                async move {
+                    // Update inode metadata (decremented nlink)
+                    trx.set(&ino_key, &meta_data);
+                    // Remove this specific path mapping
+                    trx.clear(&path_key);
+                    // Remove parent-child entry
+                    trx.clear(&child_key);
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| RustreError::Fdb(format!("FDB txn_dec_nlink: {e}")))?;
+        Ok(())
+    }
+
     /// Atomically rename a file/directory: update inode metadata, path mapping, and parent-child links.
     pub async fn txn_rename(
         &self,

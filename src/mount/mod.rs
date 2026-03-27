@@ -209,6 +209,14 @@ pub struct RustreFs {
     inodes: Arc<InodeMap>,
     /// Open file handles: fh → OpenFile (lock-free DashMap)
     open_files: Arc<DashMap<u64, OpenFile>>,
+    /// Open directory handles: fh → snapshot of entries at opendir time.
+    ///
+    /// readdir is called repeatedly with increasing offsets.  If we re-fetch
+    /// the entry list from MDS every time, concurrent deletes shift the list
+    /// and cause offsets to skip entries — making `rm -rf` leave leftover
+    /// files.  Snapshotting at opendir keeps the list stable for the whole
+    /// readdir sequence.
+    open_dirs: Arc<DashMap<u64, Vec<(INodeNo, FileType, String)>>>,
     /// Next file handle number
     next_fh: AtomicU64,
 }
@@ -272,6 +280,7 @@ impl RustreFs {
             config,
             inodes: Arc::new(inode_map),
             open_files: Arc::new(DashMap::new()),
+            open_dirs: Arc::new(DashMap::new()),
             next_fh: AtomicU64::new(1),
         })
     }
@@ -1101,14 +1110,35 @@ impl Filesystem for RustreFs {
     }
 
     // -- readdir: list directory contents --
+    //
+    // Uses the snapshot captured at opendir time so that concurrent deletes
+    // (e.g. `rm -rf`) don't shift the entry list and cause offset-based
+    // iteration to skip entries.
     fn readdir(
         &self,
         _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
+        _ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let snapshot = match self.open_dirs.get(&fh.0) {
+            Some(s) => s,
+            None => return reply.error(Errno::EBADF),
+        };
+
+        for (i, (entry_ino, kind, name)) in snapshot.iter().enumerate().skip(offset as usize) {
+            let next_offset = (i + 1) as u64;
+            if reply.add(*entry_ino, next_offset, *kind, name) {
+                break; // buffer full
+            }
+        }
+
+        reply.ok();
+    }
+
+    // -- opendir: open a directory and snapshot its contents --
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino_val = ino.0;
         let path = match self.inodes.get_path(ino_val) {
             Some(p) => p,
@@ -1120,6 +1150,7 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
+        // Fetch directory entries from MDS and snapshot them for this handle.
         let entries = self.rt.block_on(async {
             let rpc_reply = rpc_call(&mds, RpcKind::Readdir(path.clone()))
                 .await
@@ -1144,7 +1175,7 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        // Build directory listing: . and .. first, then children
+        // Build the full entry list: . and .. first, then children
         let parent_ino = self
             .inodes
             .get_meta(ino_val)
@@ -1159,7 +1190,7 @@ impl Filesystem for RustreFs {
             "..".to_string(),
         ));
 
-        // Cache children and build entries
+        // Cache children in inode map and build entries
         for child in &entries {
             self.inodes.insert(child.clone());
         }
@@ -1175,35 +1206,20 @@ impl Filesystem for RustreFs {
             all_entries.push((INodeNo(entry.ino), kind, entry.name.clone()));
         }
 
-        // Apply offset and fill reply
-        for (i, (entry_ino, kind, name)) in all_entries.iter().enumerate().skip(offset as usize) {
-            let next_offset = (i + 1) as u64;
-            if reply.add(*entry_ino, next_offset, *kind, name) {
-                break; // buffer full
-            }
-        }
-
-        reply.ok();
-    }
-
-    // -- opendir/releasedir/fsyncdir --
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if self.inodes.get_meta(ino.0).is_some() {
-            let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-            reply.opened(FileHandle(fh), FopenFlags::empty());
-        } else {
-            reply.error(Errno::ENOENT);
-        }
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_dirs.insert(fh, all_entries);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn releasedir(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
+        self.open_dirs.remove(&fh.0);
         reply.ok();
     }
 
@@ -1280,7 +1296,7 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        // Get file metadata first (need ino for OSS cleanup)
+        // Get file metadata first (need ino + nlink for deciding OSS cleanup)
         let meta = match self.stat_path(&path) {
             Ok(m) => m,
             Err(e) => return reply.error(e),
@@ -1288,6 +1304,7 @@ impl Filesystem for RustreFs {
 
         let ino = meta.ino;
         let has_objects = meta.layout.is_some();
+        let nlink = meta.nlink;
         let config = self.snap_config();
 
         let mds = match self.pick_mds() {
@@ -1295,7 +1312,7 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        // MDS unlink first (same protocol as client/rm.rs)
+        // MDS unlink first (MDS handles nlink decrement vs full removal)
         let result = self.rt.block_on(async {
             let rpc_reply = rpc_call(&mds, RpcKind::Unlink(path.clone()))
                 .await
@@ -1317,22 +1334,26 @@ impl Filesystem for RustreFs {
             return reply.error(e);
         }
 
-        // Best-effort OSS cleanup
-        if has_objects {
-            self.rt.block_on(async {
-                let mut futures = Vec::new();
-                for ost_info in &config.ost_list {
-                    let addr = ost_info.address.clone();
-                    futures.push(tokio::spawn(async move {
-                        let _ = rpc_call(&addr, RpcKind::ObjDeleteInode { ino }).await;
-                    }));
-                }
-                futures::future::join_all(futures).await;
-            });
+        if nlink <= 1 {
+            // Last link removed — clean up OSS objects and inode cache
+            if has_objects {
+                self.rt.block_on(async {
+                    let mut futures = Vec::new();
+                    for ost_info in &config.ost_list {
+                        let addr = ost_info.address.clone();
+                        futures.push(tokio::spawn(async move {
+                            let _ = rpc_call(&addr, RpcKind::ObjDeleteInode { ino }).await;
+                        }));
+                    }
+                    futures::future::join_all(futures).await;
+                });
+            }
+            // Remove inode from cache entirely
+            self.inodes.remove(ino);
+        } else {
+            // Other links still exist — only remove this path from cache
+            self.inodes.path_to_ino.remove(&path);
         }
-
-        // Remove from cache
-        self.inodes.remove(ino);
         reply.ok();
     }
 
@@ -1558,21 +1579,64 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
-        let attr = meta_to_attr(&meta);
         let ino = meta.ino;
+
+        // Immediately commit the pending file so it's visible to lookups and
+        // readdir right away.  Without this, tools like `git init` (via libgit2)
+        // fail because they create a file, then stat/readdir the parent, and
+        // MDS filters out pending entries.
+        //
+        // The file starts at size 0.  Writes go through write_through() directly
+        // to OST, and the final size is synced to MDS on flush/release via
+        // SetSize (the normal non-pending path).
+        let commit_result = self.rt.block_on(async {
+            let mds_addr = self.pick_mds()?;
+            let reply = rpc_call(
+                &mds_addr,
+                RpcKind::CommitCreate { ino, size: 0 },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
+            match reply.kind {
+                RpcKind::Ok => Ok(()),
+                RpcKind::Error(e) => {
+                    error!("immediate commit after create failed: {e}");
+                    Err(Errno::EIO)
+                }
+                _ => Err(Errno::EIO),
+            }
+        });
+
+        if let Err(e) = commit_result {
+            // Best-effort abort the pending MDS record
+            let _ = self.rt.block_on(async {
+                let mds_addr = self.pick_mds().ok();
+                if let Some(addr) = mds_addr {
+                    let _ = rpc_call(&addr, RpcKind::AbortCreate { ino }).await;
+                }
+            });
+            return reply.error(e);
+        }
+
+        // Update meta to reflect committed state
+        let mut meta = meta;
+        meta.pending = false;
+
+        let attr = meta_to_attr(&meta);
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
-        // Cache the inode
+        // Cache the inode (committed, visible)
         self.inodes.insert(meta.clone());
 
-        // Create open file handle
+        // Create open file handle — NOT pending, so writes mark size_dirty
+        // and flush/release syncs size via SetSize.
         let open_file = OpenFile {
             ino,
             tracked_size: AtomicU64::new(0),
             meta,
             write_buf: Mutex::new(Vec::new()),
             writable: true,
-            pending: true, // Will be committed on flush/release
+            pending: false,
             size_dirty: false,
         };
 
