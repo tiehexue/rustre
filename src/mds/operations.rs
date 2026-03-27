@@ -737,9 +737,7 @@ pub async fn handle_link(
     meta.mtime = FileMeta::now_secs();
 
     // Atomically: update inode nlink + add new path mapping + add parent-child entry
-    st.store
-        .txn_link(ino, &meta, &new_path, new_parent_ino)
-        .await?;
+    st.store.txn_link(ino, &meta, &new_path, new_parent_ino).await?;
 
     info!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
