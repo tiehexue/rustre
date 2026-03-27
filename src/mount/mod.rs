@@ -1492,7 +1492,7 @@ impl Filesystem for RustreFs {
         if meta.is_dir {
             return reply.error(Errno::EISDIR);
         }
-        
+
         // Symlinks don't have data on OSTs
         if meta.symlink_target.is_some() {
             return reply.error(Errno::EINVAL);

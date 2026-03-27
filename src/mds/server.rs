@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 /// Main entry point for MDS server
 pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()> {
-    let store = FdbMdsStore::new(cluster_name)?;
+    let store = Arc::new(FdbMdsStore::new(cluster_name)?);
 
     // Ensure root directory exists in FDB (idempotent)
     store.ensure_root().await?;
@@ -21,14 +21,18 @@ pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()>
 
     // Request initial inode range from MGS
     let (ino_start, ino_end) = operations::alloc_initial_inode_range(mgs_addr).await?;
-    let ino_alloc = operations::InodeAllocator::new(ino_start, ino_end, mgs_addr.to_string());
+    let ino_alloc = Arc::new(operations::InodeAllocator::new(
+        ino_start,
+        ino_end,
+        mgs_addr.to_string(),
+    ));
 
-    let state = Arc::new(RwLock::new(operations::MdsState {
+    let state = Arc::new(operations::MdsState {
         store,
-        cluster_config: config,
+        cluster_config: RwLock::new(config),
         mgs_addr: mgs_addr.to_string(),
         ino_alloc,
-    }));
+    });
 
     // Register with MGS
     operations::register_with_mgs(mgs_addr, listen).await?;
@@ -41,8 +45,8 @@ pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()>
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 if let Ok(cfg) = operations::fetch_config(&mgs).await {
-                    let mut st = state.write().await;
-                    st.cluster_config = cfg;
+                    let mut config_write = state.cluster_config.write().await;
+                    *config_write = cfg;
                 }
             }
         });
@@ -62,10 +66,7 @@ pub async fn run(listen: &str, mgs_addr: &str, cluster_name: &str) -> Result<()>
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    state: Arc<RwLock<operations::MdsState>>,
-) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, state: Arc<operations::MdsState>) -> Result<()> {
     let msg = recv_msg(&mut stream).await?;
     let reply = match msg.kind {
         RpcKind::Lookup(path) => operations::handle_lookup(msg.id, &path, &state).await,
