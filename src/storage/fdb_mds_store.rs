@@ -382,6 +382,7 @@ impl FdbMdsStore {
             parent_ino: 0,
             pending: false,
             nlink: 2, // root dir: . and parent
+            symlink_target: None,
         };
 
         // Atomically set root inode + path in one transaction

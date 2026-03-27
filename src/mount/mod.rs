@@ -92,6 +92,8 @@ fn rustre_err_to_errno(e: RustreError) -> Errno {
 fn meta_to_attr(meta: &FileMeta) -> FileAttr {
     let kind = if meta.is_dir {
         FileType::Directory
+    } else if meta.symlink_target.is_some() {
+        FileType::Symlink
     } else {
         FileType::RegularFile
     };
@@ -1165,6 +1167,8 @@ impl Filesystem for RustreFs {
         for entry in &entries {
             let kind = if entry.is_dir {
                 FileType::Directory
+            } else if entry.symlink_target.is_some() {
+                FileType::Symlink
             } else {
                 FileType::RegularFile
             };
@@ -1488,6 +1492,11 @@ impl Filesystem for RustreFs {
         if meta.is_dir {
             return reply.error(Errno::EISDIR);
         }
+        
+        // Symlinks don't have data on OSTs
+        if meta.symlink_target.is_some() {
+            return reply.error(Errno::EINVAL);
+        }
 
         match self.read_data(&meta, offset, size) {
             Ok(data) => reply.data(&data),
@@ -1602,6 +1611,10 @@ impl Filesystem for RustreFs {
                 let file = file_ref.value();
                 if !file.writable {
                     return reply.error(Errno::EBADF);
+                }
+                // Can't write to symlinks
+                if file.meta.symlink_target.is_some() {
+                    return reply.error(Errno::EINVAL);
                 }
                 (
                     file.ino,
@@ -1779,6 +1792,79 @@ impl Filesystem for RustreFs {
                 reply.entry(&ENTRY_TTL, &attr, Generation(0));
             }
             Err(e) => reply.error(e),
+        }
+    }
+
+    // -- symlink: create a symbolic link --
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let path = match self.child_path(parent.0, name) {
+            Ok(p) => p,
+            Err(e) => return reply.error(e),
+        };
+
+        let target_str = match target.to_str() {
+            Some(s) => s,
+            None => return reply.error(Errno::EINVAL),
+        };
+        let mds = match self.pick_mds() {
+            Ok(m) => m,
+            Err(e) => return reply.error(e),
+        };
+
+        let result = self.rt.block_on(async {
+            let rpc_reply = rpc_call(
+                &mds,
+                RpcKind::Symlink {
+                    path: path.clone(),
+                    target: target_str.to_string(),
+                },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
+            match rpc_reply.kind {
+                RpcKind::MetaReply(m) => Ok(m),
+                RpcKind::Error(e) => {
+                    if e.contains("already exists") {
+                        Err(Errno::EEXIST)
+                    } else if e.contains("not found") {
+                        Err(Errno::ENOENT)
+                    } else if e.contains("not a directory") {
+                        Err(Errno::ENOTDIR)
+                    } else {
+                        Err(Errno::EIO)
+                    }
+                }
+                _ => Err(Errno::EIO),
+            }
+        });
+
+        match result {
+            Ok(meta) => {
+                let attr = meta_to_attr(&meta);
+                self.inodes.insert(meta);
+                reply.entry(&ENTRY_TTL, &attr, Generation(0));
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    // -- readlink: read symbolic link target --
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let meta = match self.inodes.get_meta(ino.0) {
+            Some(m) => m,
+            None => return reply.error(Errno::ENOENT),
+        };
+
+        match meta.symlink_target {
+            Some(ref target) => reply.data(target.as_bytes()),
+            None => reply.error(Errno::EINVAL), // Not a symlink
         }
     }
 
