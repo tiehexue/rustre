@@ -30,8 +30,8 @@ use fuser::{
     TimeOrNow, WriteFlags,
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use parking_lot::{Mutex, RwLock};
 use std::ffi::OsStr;
@@ -343,6 +343,9 @@ impl RustreFs {
         let mut result = vec![0u8; read_len];
 
         self.rt.block_on(async {
+            let mut read_handles = Vec::new();
+
+            // Create a task for each chunk to read in parallel
             for chunk_idx in first_chunk..=last_chunk {
                 let chunk_file_offset = chunk_idx as u64 * chunk_size;
                 let chunk_end = std::cmp::min(chunk_file_offset + chunk_size, file_size);
@@ -366,20 +369,41 @@ impl RustreFs {
                     0
                 };
 
-                // Fetch the whole chunk from OST
+                // Fetch the whole chunk from OST in parallel
                 let object_id = StripeLayout::object_id(meta.ino, chunk_idx);
                 let primary_ost = layout.ost_for_chunk(chunk_idx);
                 let addr = ost_addr(&config, primary_ost).map_err(rustre_err_to_errno)?;
+                let addr = addr.clone();
 
-                let chunk_data = read_chunk_from_ost(&addr, &object_id).await?;
+                read_handles.push((
+                    chunk_idx,
+                    buf_start,
+                    read_start_in_chunk,
+                    read_end_in_chunk,
+                    tokio::spawn(async move { read_chunk_from_ost(&addr, &object_id).await }),
+                ));
+            }
 
-                // Copy the relevant portion into result
-                if chunk_data.len() >= read_end_in_chunk {
-                    let src = &chunk_data[read_start_in_chunk..read_end_in_chunk];
-                    let dst = &mut result[buf_start..buf_start + src.len()];
-                    dst.copy_from_slice(src);
+            // Wait for all reads to complete and copy data into result buffer
+            for (chunk_idx, buf_start, read_start_in_chunk, read_end_in_chunk, handle) in
+                read_handles
+            {
+                match handle.await {
+                    Ok(Ok(chunk_data)) => {
+                        if chunk_data.len() >= read_end_in_chunk {
+                            let src = &chunk_data[read_start_in_chunk..read_end_in_chunk];
+                            let dst = &mut result[buf_start..buf_start + src.len()];
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        error!("read task panicked for chunk {}: {}", chunk_idx, e);
+                        return Err(Errno::EIO);
+                    }
                 }
             }
+
             Ok(result)
         })
     }
@@ -412,7 +436,14 @@ impl RustreFs {
     /// This makes newly written bytes visible before close()/flush(), which is
     /// critical for toolchains that reopen, mmap, or back-patch their outputs
     /// while the same file handle is still alive.
-    fn write_through(&self, ino: u64, meta: &FileMeta, logical_size: u64, offset: u64, data: &[u8]) -> Result<(), Errno> {
+    fn write_through(
+        &self,
+        ino: u64,
+        meta: &FileMeta,
+        logical_size: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Errno> {
         if data.is_empty() {
             return Ok(());
         }
@@ -425,9 +456,10 @@ impl RustreFs {
         let last_chunk = ((write_end - 1) / chunk_size) as u32;
         let layout_clone = layout.clone();
         let config_clone = config.clone();
-        let data = data.to_vec();
 
         self.rt.block_on(async move {
+            let mut write_handles = Vec::new();
+
             for chunk_idx in first_chunk..=last_chunk {
                 let chunk_file_start = chunk_idx as u64 * chunk_size;
                 let chunk_file_end = chunk_file_start + chunk_size;
@@ -444,19 +476,45 @@ impl RustreFs {
                 let ost_index = layout_clone.ost_for_chunk(chunk_idx);
                 let addr = ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
 
-                let existing = read_chunk_from_ost(&addr, &object_id).await?;
-                let target_len = std::cmp::max(existing.len(), logical_len);
-                let mut chunk_data = vec![0u8; target_len];
-                chunk_data[..existing.len()].copy_from_slice(&existing);
+                // Check if we're writing the entire chunk from start to end
+                let writes_entire_chunk =
+                    write_start == chunk_file_start && write_end == chunk_file_end;
 
-                let dst_start = (write_start - chunk_file_start) as usize;
-                let dst_end = (write_end - chunk_file_start) as usize;
-                let src_start = (write_start - offset) as usize;
-                let src_end = (write_end - offset) as usize;
-                chunk_data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+                if writes_entire_chunk {
+                    // For entire chunk writes, we can write directly without reading existing data
+                    let chunk_data = data
+                        [(write_start - offset) as usize..(write_end - offset) as usize]
+                        .to_vec();
 
-                write_chunk_to_ost(&addr, &object_id, &chunk_data).await?;
+                    let addr_clone = addr.clone();
+                    write_handles.push(tokio::spawn(async move {
+                        write_chunk_to_ost(&addr_clone, &object_id, &chunk_data).await
+                    }));
+                } else {
+                    // For partial writes, we need to read-merge-write
+                    let existing = read_chunk_from_ost(&addr, &object_id).await?;
+                    let target_len = std::cmp::max(existing.len(), logical_len);
+                    let mut chunk_data = vec![0u8; target_len];
+                    chunk_data[..existing.len()].copy_from_slice(&existing);
+
+                    let dst_start = (write_start - chunk_file_start) as usize;
+                    let dst_end = (write_end - chunk_file_start) as usize;
+                    let src_start = (write_start - offset) as usize;
+                    let src_end = (write_end - offset) as usize;
+                    chunk_data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+
+                    let addr_clone = addr.clone();
+                    write_handles.push(tokio::spawn(async move {
+                        write_chunk_to_ost(&addr_clone, &object_id, &chunk_data).await
+                    }));
+                }
             }
+
+            // Wait for all writes to complete
+            for handle in write_handles {
+                handle.await.map_err(|_| Errno::EIO)??;
+            }
+
             Ok(())
         })
     }
@@ -475,7 +533,13 @@ impl RustreFs {
             if is_empty && !file.pending && !file.size_dirty {
                 return Ok(());
             }
-            (file.ino, file.meta.clone(), buf, file.pending, file.size_dirty)
+            (
+                file.ino,
+                file.meta.clone(),
+                buf,
+                file.pending,
+                file.size_dirty,
+            )
         };
 
         if write_buf.is_empty() {
@@ -590,8 +654,7 @@ impl RustreFs {
                     let dst_end = (write_end_in_file - chunk_file_start) as usize;
                     let src_start = (write_start_in_file - min_off) as usize;
                     let src_end = (write_end_in_file - min_off) as usize;
-                    chunk_data[dst_start..dst_end]
-                        .copy_from_slice(&flat_buf[src_start..src_end]);
+                    chunk_data[dst_start..dst_end].copy_from_slice(&flat_buf[src_start..src_end]);
                 }
 
                 // If this chunk is only partially written and the file already had data
@@ -602,8 +665,7 @@ impl RustreFs {
                 if !chunk_fully_covered && meta.size > chunk_file_start {
                     let object_id = StripeLayout::object_id(ino, chunk_idx);
                     let ost_index = layout_clone.ost_for_chunk(chunk_idx);
-                    let addr =
-                        ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
+                    let addr = ost_addr(&config_clone, ost_index).map_err(rustre_err_to_errno)?;
                     if let Ok(existing) = read_chunk_from_ost(&addr, &object_id).await {
                         if !existing.is_empty() {
                             // Merge: fill in only the bytes NOT covered by our write
@@ -764,7 +826,11 @@ async fn write_chunk_to_ost(addr: &str, object_id: &str, data: &[u8]) -> Result<
 
 impl Filesystem for RustreFs {
     // -- init: called when the filesystem is mounted --
-    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), std::io::Error> {
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), std::io::Error> {
         // If the kernel supports mmap on direct-IO files, opt in. We return
         // FOPEN_DIRECT_IO only for writable handles to avoid macFUSE buffered-write
         // corruption, and this keeps mmap-based writers working when supported.
@@ -924,9 +990,7 @@ impl Filesystem for RustreFs {
         // Handle truncate
         if let Some(new_size) = size {
             // First try explicit file handle
-            let maybe_fh = fh.and_then(|fh_val| {
-                self.open_files.get(&fh_val.0).map(|_| fh_val.0)
-            });
+            let maybe_fh = fh.and_then(|fh_val| self.open_files.get(&fh_val.0).map(|_| fh_val.0));
 
             // If no fh provided (or fh not found), search by ino
             let effective_fh = maybe_fh.or_else(|| {
@@ -1332,15 +1396,9 @@ impl Filesystem for RustreFs {
             };
             let path = meta.path.clone();
             let result = self.rt.block_on(async {
-                let rpc_reply = rpc_call(
-                    &mds,
-                    RpcKind::SetSize {
-                        path,
-                        size: 0,
-                    },
-                )
-                .await
-                .map_err(rustre_err_to_errno)?;
+                let rpc_reply = rpc_call(&mds, RpcKind::SetSize { path, size: 0 })
+                    .await
+                    .map_err(rustre_err_to_errno)?;
                 match rpc_reply.kind {
                     RpcKind::Ok => Ok(()),
                     RpcKind::Error(e) => {
@@ -1558,8 +1616,48 @@ impl Filesystem for RustreFs {
         let new_end = offset + data.len() as u64;
         let logical_size = std::cmp::max(current_size, new_end);
 
-        if let Err(e) = self.write_through(ino, &meta, logical_size, offset, data) {
-            return reply.error(e);
+        // Determine if this write covers one or more complete chunks
+        let layout = match meta.layout.as_ref() {
+            Some(l) => l,
+            None => {
+                // No layout (shouldn't happen for a file with data)
+                return reply.error(Errno::EIO);
+            }
+        };
+
+        let chunk_size = layout.stripe_size;
+        let write_end = offset + data.len() as u64;
+
+        // Check if write starts and ends on chunk boundaries
+        let starts_on_boundary = offset % chunk_size == 0;
+
+        // Check if write covers at least one full chunk
+        let mut covers_full_chunk = false;
+        if starts_on_boundary {
+            let first_chunk = (offset / chunk_size) as u32;
+            let last_chunk = ((write_end - 1) / chunk_size) as u32;
+            for chunk_idx in first_chunk..=last_chunk {
+                let chunk_start = chunk_idx as u64 * chunk_size;
+                let chunk_end = chunk_start + chunk_size;
+                if offset <= chunk_start && write_end >= chunk_end {
+                    covers_full_chunk = true;
+                    break;
+                }
+            }
+        }
+
+        // Only write through if we're covering at least one full chunk
+        // Partial writes are buffered and will be flushed later
+        if covers_full_chunk {
+            if let Err(e) = self.write_through(ino, &meta, logical_size, offset, data) {
+                return reply.error(e);
+            }
+        } else {
+            // Buffer the write
+            if let Some(file_ref) = self.open_files.get_mut(&fh_val) {
+                let mut wb = file_ref.write_buf.lock();
+                wb.push((offset, data.to_vec()));
+            }
         }
 
         if let Some(mut file_ref) = self.open_files.get_mut(&fh_val) {
@@ -1810,13 +1908,7 @@ impl Filesystem for RustreFs {
         reply.ok();
     }
 
-    fn removexattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        reply: ReplyEmpty,
-    ) {
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         // Silently succeed — same rationale as setxattr
         reply.ok();
     }
