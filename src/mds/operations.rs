@@ -8,6 +8,7 @@ use crate::types::{ClusterConfig, CreateReq, FileMeta, StripeLayout, DEFAULT_STR
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
@@ -120,12 +121,13 @@ pub async fn alloc_initial_inode_range(mgs_addr: &str) -> Result<(u64, u64)> {
     }
 }
 
-/// MDS runtime state
+/// MDS runtime state - split to reduce lock contention
+/// Only cluster_config needs synchronization, other fields are thread-safe
 pub struct MdsState {
-    pub store: FdbMdsStore,
-    pub cluster_config: ClusterConfig,
+    pub store: Arc<FdbMdsStore>,
+    pub cluster_config: RwLock<ClusterConfig>,
     pub mgs_addr: String,
-    pub ino_alloc: InodeAllocator,
+    pub ino_alloc: Arc<InodeAllocator>,
 }
 
 /// Fetch cluster config from MGS
@@ -165,21 +167,16 @@ pub async fn register_with_mgs(mgs_addr: &str, listen: &str) -> Result<()> {
 
 /// Handle lookup operation.
 /// Pending files (write-intent not yet committed) are invisible to lookups.
-pub async fn handle_lookup(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+pub async fn handle_lookup(req_id: u64, path: &str, state: &MdsState) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
-    let st = state.read().await;
 
-    let ino = st
+    let ino = state
         .store
         .resolve_path(&path)
         .await?
         .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
-    let meta = st
+    let meta = state
         .store
         .get_inode(ino)
         .await?
@@ -194,25 +191,19 @@ pub async fn handle_lookup(
 }
 
 /// Handle create operation
-pub async fn handle_create(
-    req_id: u64,
-    req: CreateReq,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(&req.path);
     let parent = path_utils::parent_path(&path);
     let name = path_utils::basename(&path);
 
-    let st = state.read().await;
-
     // Check parent exists and is a directory
-    let parent_ino = st
+    let parent_ino = state
         .store
         .resolve_path(&parent)
         .await?
         .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
 
-    let parent_meta = st
+    let parent_meta = state
         .store
         .get_inode(parent_ino)
         .await?
@@ -223,30 +214,27 @@ pub async fn handle_create(
     }
 
     // Check if already exists
-    if (st.store.resolve_path(&path).await?).is_some() {
+    if (state.store.resolve_path(&path).await?).is_some() {
         return Err(RustreError::AlreadyExists(path));
     }
 
     // Fetch latest OST info from MGS to ensure we have up-to-date available OSTs
     // This is critical because OSTs may go down and the cached config could be stale
-    let mgs_addr = st.mgs_addr.clone();
-    drop(st); // Release the read lock before making RPC call
-
-    let latest_config = fetch_config(&mgs_addr).await?;
+    let latest_config = fetch_config(&state.mgs_addr).await?;
 
     // Update the cached cluster_config with the latest info
     {
-        let mut st_write = state.write().await;
-        st_write.cluster_config = latest_config.clone();
+        let mut config_write = state.cluster_config.write().await;
+        *config_write = latest_config.clone();
     }
 
-    // Re-acquire read lock for store operations
-    let st = state.read().await;
+    // Get read access to config for stripe layout computation
+    let config_read = state.cluster_config.read().await;
 
     // Compute stripe layout using actual available OST indices from latest config
     // Note: ost_list may have gaps (e.g., [ost-0, ost-2, ost-3] if ost-1 is down)
     // We must use the actual ost_index values, not positions in the list
-    let available_osts: Vec<u32> = latest_config
+    let available_osts: Vec<u32> = config_read
         .ost_list
         .iter()
         .map(|ost| ost.ost_index)
@@ -267,7 +255,7 @@ pub async fn handle_create(
     };
 
     // Allocate inode from local range (zero FDB contention)
-    let ino = st.ino_alloc.alloc().await?;
+    let ino = state.ino_alloc.alloc().await?;
 
     // Stripe offset: spread files across available OSTs for even distribution
     // This is an index into the available_osts vector, not the absolute OST index
@@ -337,7 +325,7 @@ pub async fn handle_create(
     };
 
     // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
-    st.store.txn_create(&meta, &path, parent_ino).await?;
+    state.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!(
         "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={} (pending)",
@@ -347,27 +335,25 @@ pub async fn handle_create(
 }
 
 /// Handle mkdir operation
-pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> Result<RpcMessage> {
+pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
     let parent = path_utils::parent_path(&path);
     let name = path_utils::basename(&path);
 
-    let st = state.read().await;
-
     // Check parent exists
-    let parent_ino = st
+    let parent_ino = state
         .store
         .resolve_path(&parent)
         .await?
         .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
 
     // Check not exists
-    if (st.store.resolve_path(&path).await?).is_some() {
+    if (state.store.resolve_path(&path).await?).is_some() {
         return Err(RustreError::AlreadyExists(path));
     }
 
     // Allocate inode from local range (zero FDB contention)
-    let ino = st.ino_alloc.alloc().await?;
+    let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
     let meta = FileMeta {
@@ -386,28 +372,23 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &RwLock<MdsState>) -> 
     };
 
     // Persist atomically: inode + path + child entry + next_ino
-    st.store.txn_create(&meta, &path, parent_ino).await?;
+    state.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!("MDS: created directory {path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
 /// Handle readdir operation
-pub async fn handle_readdir(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+pub async fn handle_readdir(req_id: u64, path: &str, state: &MdsState) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
-    let st = state.read().await;
 
-    let ino = st
+    let ino = state
         .store
         .resolve_path(&path)
         .await?
         .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
-    let meta = st
+    let meta = state
         .store
         .get_inode(ino)
         .await?
@@ -418,11 +399,11 @@ pub async fn handle_readdir(
     }
 
     // List children via FDB range scan
-    let child_inos = st.store.list_children(ino).await?;
+    let child_inos = state.store.list_children(ino).await?;
 
     let mut entries = Vec::new();
     for child_ino in child_inos {
-        if let Some(child_meta) = st.store.get_inode(child_ino).await? {
+        if let Some(child_meta) = state.store.get_inode(child_ino).await? {
             // Skip pending files — they're not visible until committed
             if !child_meta.pending {
                 entries.push(child_meta);
@@ -434,11 +415,7 @@ pub async fn handle_readdir(
 }
 
 /// Handle unlink operation
-pub async fn handle_unlink(
-    req_id: u64,
-    path: &str,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
+pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
     if path == "/" {
         return Err(RustreError::InvalidArgument(
@@ -446,15 +423,13 @@ pub async fn handle_unlink(
         ));
     }
 
-    let st = state.read().await;
-
-    let ino = st
+    let ino = state
         .store
         .resolve_path(&path)
         .await?
         .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
-    let meta = st
+    let meta = state
         .store
         .get_inode(ino)
         .await?
@@ -462,13 +437,14 @@ pub async fn handle_unlink(
 
     if meta.is_dir {
         // Check directory is empty
-        if st.store.has_children(ino).await? {
+        if state.store.has_children(ino).await? {
             return Err(RustreError::DirNotEmpty(path));
         }
     }
 
     // Atomically remove: inode + path + parent's child entry (+ children range for dirs)
-    st.store
+    state
+        .store
         .txn_unlink(ino, &path, meta.parent_ino, meta.is_dir)
         .await?;
 
@@ -481,18 +457,17 @@ pub async fn handle_set_size(
     req_id: u64,
     path: &str,
     size: u64,
-    state: &RwLock<MdsState>,
+    state: &MdsState,
 ) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
-    let st = state.read().await;
 
-    let ino = st
+    let ino = state
         .store
         .resolve_path(&path)
         .await?
         .ok_or_else(|| RustreError::NotFound(path.clone()))?;
 
-    let mut meta = st
+    let mut meta = state
         .store
         .get_inode(ino)
         .await?
@@ -500,7 +475,7 @@ pub async fn handle_set_size(
 
     meta.size = size;
     meta.mtime = FileMeta::now_secs();
-    st.store.set_inode(ino, &meta).await?;
+    state.store.set_inode(ino, &meta).await?;
 
     Ok(make_reply(req_id, RpcKind::Ok))
 }
@@ -514,11 +489,9 @@ pub async fn handle_commit_create(
     req_id: u64,
     ino: u64,
     size: u64,
-    state: &RwLock<MdsState>,
+    state: &MdsState,
 ) -> Result<RpcMessage> {
-    let st = state.read().await;
-
-    let mut meta = st
+    let mut meta = state
         .store
         .get_inode(ino)
         .await?
@@ -532,7 +505,7 @@ pub async fn handle_commit_create(
     meta.size = size;
     meta.mtime = FileMeta::now_secs();
     meta.pending = false;
-    st.store.set_inode(ino, &meta).await?;
+    state.store.set_inode(ino, &meta).await?;
 
     info!("MDS: committed file {} ino={ino} size={size}", meta.path);
     Ok(make_reply(req_id, RpcKind::Ok))
@@ -544,14 +517,8 @@ pub async fn handle_commit_create(
 /// Uses ino directly — no redundant path resolution.
 /// Only removes if the file is still pending (prevents aborting a committed file).
 /// Idempotent: if already gone, returns Ok silently.
-pub async fn handle_abort_create(
-    req_id: u64,
-    ino: u64,
-    state: &RwLock<MdsState>,
-) -> Result<RpcMessage> {
-    let st = state.read().await;
-
-    let meta = match st.store.get_inode(ino).await? {
+pub async fn handle_abort_create(req_id: u64, ino: u64, state: &MdsState) -> Result<RpcMessage> {
+    let meta = match state.store.get_inode(ino).await? {
         Some(m) => m,
         None => {
             // Already gone — idempotent
@@ -564,7 +531,8 @@ pub async fn handle_abort_create(
         return Ok(make_reply(req_id, RpcKind::Ok));
     }
 
-    st.store
+    state
+        .store
         .txn_unlink(ino, &meta.path, meta.parent_ino, false)
         .await?;
 
@@ -577,7 +545,7 @@ pub async fn handle_rename(
     req_id: u64,
     old_path: &str,
     new_path: &str,
-    state: &RwLock<MdsState>,
+    state: &MdsState,
 ) -> Result<RpcMessage> {
     let old_path = path_utils::normalize_path(old_path);
     let new_path = path_utils::normalize_path(new_path);
@@ -597,16 +565,14 @@ pub async fn handle_rename(
         return Ok(make_reply(req_id, RpcKind::Ok));
     }
 
-    let st = state.read().await;
-
     // Get the inode being renamed
-    let ino = st
+    let ino = state
         .store
         .resolve_path(&old_path)
         .await?
         .ok_or_else(|| RustreError::NotFound(old_path.clone()))?;
 
-    let mut meta = st
+    let mut meta = state
         .store
         .get_inode(ino)
         .await?
@@ -614,13 +580,13 @@ pub async fn handle_rename(
 
     // Check if new parent directory exists
     let new_parent = path_utils::parent_path(&new_path);
-    let new_parent_ino = st
+    let new_parent_ino = state
         .store
         .resolve_path(&new_parent)
         .await?
         .ok_or_else(|| RustreError::NotFound(format!("parent directory: {new_parent}")))?;
 
-    let new_parent_meta = st
+    let new_parent_meta = state
         .store
         .get_inode(new_parent_ino)
         .await?
@@ -631,9 +597,9 @@ pub async fn handle_rename(
     }
 
     // Check if new path already exists
-    if let Some(existing_ino) = st.store.resolve_path(&new_path).await? {
+    if let Some(existing_ino) = state.store.resolve_path(&new_path).await? {
         // Target exists - need to unlink it first (POSIX rename replaces)
-        let existing_meta = st
+        let existing_meta = state
             .store
             .get_inode(existing_ino)
             .await?
@@ -647,7 +613,7 @@ pub async fn handle_rename(
                 ));
             }
             // Check if target directory is empty
-            if st.store.has_children(existing_ino).await? {
+            if state.store.has_children(existing_ino).await? {
                 return Err(RustreError::DirNotEmpty(new_path));
             }
         } else if meta.is_dir {
@@ -657,7 +623,8 @@ pub async fn handle_rename(
         }
 
         // Unlink the existing target
-        st.store
+        state
+            .store
             .txn_unlink(
                 existing_ino,
                 &new_path,
@@ -675,7 +642,8 @@ pub async fn handle_rename(
     meta.mtime = FileMeta::now_secs();
 
     // Perform the rename transaction atomically
-    st.store
+    state
+        .store
         .txn_rename(
             ino,
             &old_path,
@@ -695,16 +663,14 @@ pub async fn handle_link(
     req_id: u64,
     ino: u64,
     new_path: &str,
-    state: &RwLock<MdsState>,
+    state: &MdsState,
 ) -> Result<RpcMessage> {
     let new_path = path_utils::normalize_path(new_path);
     let new_parent = path_utils::parent_path(&new_path);
     let _new_name = path_utils::basename(&new_path);
 
-    let st = state.read().await;
-
     // Get existing inode
-    let mut meta = st
+    let mut meta = state
         .store
         .get_inode(ino)
         .await?
@@ -723,14 +689,14 @@ pub async fn handle_link(
     }
 
     // Check new parent exists
-    let new_parent_ino = st
+    let new_parent_ino = state
         .store
         .resolve_path(&new_parent)
         .await?
         .ok_or_else(|| RustreError::NotFound(format!("parent directory: {new_parent}")))?;
 
     // Check target doesn't already exist
-    if (st.store.resolve_path(&new_path).await?).is_some() {
+    if (state.store.resolve_path(&new_path).await?).is_some() {
         return Err(RustreError::AlreadyExists(new_path));
     }
 
@@ -739,7 +705,8 @@ pub async fn handle_link(
     meta.mtime = FileMeta::now_secs();
 
     // Atomically: update inode nlink + add new path mapping + add parent-child entry
-    st.store
+    state
+        .store
         .txn_link(ino, &meta, &new_path, new_parent_ino)
         .await?;
 
@@ -752,22 +719,20 @@ pub async fn handle_symlink(
     req_id: u64,
     path: &str,
     target: &str,
-    state: &RwLock<MdsState>,
+    state: &MdsState,
 ) -> Result<RpcMessage> {
     let path = path_utils::normalize_path(path);
     let parent = path_utils::parent_path(&path);
     let name = path_utils::basename(&path);
 
-    let st = state.read().await;
-
     // Check parent exists and is a directory
-    let parent_ino = st
+    let parent_ino = state
         .store
         .resolve_path(&parent)
         .await?
         .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
 
-    let parent_meta = st
+    let parent_meta = state
         .store
         .get_inode(parent_ino)
         .await?
@@ -778,12 +743,12 @@ pub async fn handle_symlink(
     }
 
     // Check if already exists
-    if (st.store.resolve_path(&path).await?).is_some() {
+    if (state.store.resolve_path(&path).await?).is_some() {
         return Err(RustreError::AlreadyExists(path));
     }
 
     // Allocate inode from local range
-    let ino = st.ino_alloc.alloc().await?;
+    let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
     let meta = FileMeta {
@@ -802,7 +767,7 @@ pub async fn handle_symlink(
     };
 
     // Persist atomically: inode + path + child entry
-    st.store.txn_create(&meta, &path, parent_ino).await?;
+    state.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!("MDS: created symlink {path} -> {target} ino={ino}");
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
