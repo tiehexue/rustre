@@ -73,8 +73,8 @@ async fn put_file(
 
     // ── Phase 1: Create pending file on MDS ──
     // The file is created with pending=true, invisible to other clients.
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = crate::utils::fid::get_ugid();
+
     let mode = 0o644; // Default file mode
     let reply = rpc_call(
         &mds,
