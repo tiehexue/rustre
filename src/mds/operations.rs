@@ -10,7 +10,7 @@ use rand::thread_rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Default number of inodes to request per batch from MGS.
 const INODE_RANGE_BATCH: u64 = 10_000;
@@ -328,7 +328,7 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
     // Persist atomically: inode + path + child entry + next_ino in one FDB transaction
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
-    info!(
+    debug!(
         "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={} (pending)",
         layout.ost_indices.len(),
         layout.stripe_size,
@@ -382,7 +382,7 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<R
     // Persist atomically: inode + path + child entry + next_ino
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
-    info!("MDS: created directory {path} ino={ino}");
+    debug!("MDS: created directory {path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -436,7 +436,7 @@ pub async fn handle_mkdir_with_perms(
     // Persist atomically: inode + path + child entry + next_ino
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
-    info!("MDS: created directory {path} ino={ino} mode={mode:o} uid={uid} gid={gid}");
+    debug!("MDS: created directory {path} ino={ino} mode={mode:o} uid={uid} gid={gid}");
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -477,7 +477,7 @@ pub async fn handle_set_perms(
     meta.mtime = FileMeta::now_secs();
     state.store.set_inode(ino, &meta).await?;
 
-    info!(
+    debug!(
         "MDS: set perms for {path} ino={ino} mode={:?} uid={:?} gid={:?}",
         mode, uid, gid
     );
@@ -554,7 +554,7 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
         .txn_unlink(ino, &path, meta.parent_ino, meta.is_dir)
         .await?;
 
-    info!("MDS: unlinked {path} ino={ino}");
+    debug!("MDS: unlinked {path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -613,7 +613,7 @@ pub async fn handle_commit_create(
     meta.pending = false;
     state.store.set_inode(ino, &meta).await?;
 
-    info!("MDS: committed file {} ino={ino} size={size}", meta.path);
+    debug!("MDS: committed file {} ino={ino} size={size}", meta.path);
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -642,7 +642,7 @@ pub async fn handle_abort_create(req_id: u64, ino: u64, state: &MdsState) -> Res
         .txn_unlink(ino, &meta.path, meta.parent_ino, false)
         .await?;
 
-    info!("MDS: aborted pending file {} ino={ino}", meta.path);
+    debug!("MDS: aborted pending file {} ino={ino}", meta.path);
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -760,7 +760,7 @@ pub async fn handle_rename(
         )
         .await?;
 
-    info!("MDS: renamed {old_path} -> {new_path} ino={ino}");
+    debug!("MDS: renamed {old_path} -> {new_path} ino={ino}");
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -816,7 +816,7 @@ pub async fn handle_link(
         .txn_link(ino, &meta, &new_path, new_parent_ino)
         .await?;
 
-    info!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
+    debug!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
 
@@ -880,6 +880,6 @@ pub async fn handle_symlink(
     // Persist atomically: inode + path + child entry
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
-    info!("MDS: created symlink {path} -> {target} ino={ino}");
+    debug!("MDS: created symlink {path} -> {target} ino={ino}");
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
