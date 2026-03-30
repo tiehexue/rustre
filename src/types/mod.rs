@@ -93,6 +93,15 @@ pub struct FileMeta {
     pub ctime: u64,
     /// Modification timestamp
     pub mtime: u64,
+    /// File mode (permissions + file type bits)
+    #[serde(default = "default_mode")]
+    pub mode: u32,
+    /// User ID of owner
+    #[serde(default = "default_uid")]
+    pub uid: u32,
+    /// Group ID of owner
+    #[serde(default = "default_gid")]
+    pub gid: u32,
     /// Stripe layout (None for directories)
     pub layout: Option<StripeLayout>,
     /// Parent inode number
@@ -112,6 +121,18 @@ pub struct FileMeta {
 
 fn default_nlink() -> u32 {
     1
+}
+
+fn default_mode() -> u32 {
+    0o755
+}
+
+fn default_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+fn default_gid() -> u32 {
+    unsafe { libc::getgid() }
 }
 
 impl FileMeta {
@@ -154,6 +175,9 @@ pub struct CreateReq {
     pub stripe_count: u32,
     pub stripe_size: u64,
     pub replica_count: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Status information

@@ -72,6 +72,18 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<operations::MdsStat
         RpcKind::Lookup(path) => operations::handle_lookup(msg.id, &path, &state).await,
         RpcKind::Create(req) => operations::handle_create(msg.id, req, &state).await,
         RpcKind::Mkdir(path) => operations::handle_mkdir(msg.id, &path, &state).await,
+        RpcKind::MkdirWithPerms {
+            path,
+            mode,
+            uid,
+            gid,
+        } => operations::handle_mkdir_with_perms(msg.id, &path, mode, uid, gid, &state).await,
+        RpcKind::SetPerms {
+            path,
+            mode,
+            uid,
+            gid,
+        } => operations::handle_set_perms(msg.id, &path, mode, uid, gid, &state).await,
         RpcKind::Readdir(path) => operations::handle_readdir(msg.id, &path, &state).await,
         RpcKind::Unlink(path) => operations::handle_unlink(msg.id, &path, &state).await,
         RpcKind::Stat(path) => operations::handle_lookup(msg.id, &path, &state).await,

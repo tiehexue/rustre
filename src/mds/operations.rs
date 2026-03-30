@@ -313,6 +313,9 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
         size: 0,
         ctime: now,
         mtime: now,
+        mode: req.mode,
+        uid: req.uid,
+        gid: req.gid,
         layout: Some(layout.clone()),
         parent_ino,
         // Mark as pending — invisible to lookups until CommitCreate.
@@ -356,6 +359,9 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<R
     let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let mode = 0o755; // Default directory mode
     let meta = FileMeta {
         ino,
         name: name.clone(),
@@ -364,6 +370,9 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<R
         size: 0,
         ctime: now,
         mtime: now,
+        mode,
+        uid,
+        gid,
         layout: None,
         parent_ino,
         pending: false,
@@ -375,6 +384,104 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<R
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
     info!("MDS: created directory {path} ino={ino}");
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Handle mkdir with specific permissions
+pub async fn handle_mkdir_with_perms(
+    req_id: u64,
+    path: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    state: &MdsState,
+) -> Result<RpcMessage> {
+    let path = path_utils::normalize_path(path);
+    let parent = path_utils::parent_path(&path);
+    let name = path_utils::basename(&path);
+
+    // Check parent exists
+    let parent_ino = state
+        .store
+        .resolve_path(&parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
+
+    // Check not exists
+    if (state.store.resolve_path(&path).await?).is_some() {
+        return Err(RustreError::AlreadyExists(path));
+    }
+
+    // Allocate inode from local range (zero FDB contention)
+    let ino = state.ino_alloc.alloc().await?;
+
+    let now = FileMeta::now_secs();
+    let meta = FileMeta {
+        ino,
+        name: name.clone(),
+        path: path.clone(),
+        is_dir: true,
+        size: 0,
+        ctime: now,
+        mtime: now,
+        mode,
+        uid,
+        gid,
+        layout: None,
+        parent_ino,
+        pending: false,
+        nlink: 2, // directory: . and parent
+        symlink_target: None,
+    };
+
+    // Persist atomically: inode + path + child entry + next_ino
+    state.store.txn_create(&meta, &path, parent_ino).await?;
+
+    info!("MDS: created directory {path} ino={ino} mode={mode:o} uid={uid} gid={gid}");
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Handle set permissions operation
+pub async fn handle_set_perms(
+    req_id: u64,
+    path: &str,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    state: &MdsState,
+) -> Result<RpcMessage> {
+    let path = path_utils::normalize_path(path);
+
+    let ino = state
+        .store
+        .resolve_path(&path)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    let mut meta = state
+        .store
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(path.clone()))?;
+
+    // Update fields if provided
+    if let Some(mode_val) = mode {
+        meta.mode = mode_val;
+    }
+    if let Some(uid_val) = uid {
+        meta.uid = uid_val;
+    }
+    if let Some(gid_val) = gid {
+        meta.gid = gid_val;
+    }
+
+    meta.mtime = FileMeta::now_secs();
+    state.store.set_inode(ino, &meta).await?;
+
+    info!(
+        "MDS: set perms for {path} ino={ino} mode={:?} uid={:?} gid={:?}",
+        mode, uid, gid
+    );
     Ok(make_reply(req_id, RpcKind::Ok))
 }
 
@@ -776,6 +883,9 @@ pub async fn handle_symlink(
     let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let mode = 0o777; // Symlinks have all permissions (0777)
     let meta = FileMeta {
         ino,
         name: name.clone(),
@@ -784,6 +894,9 @@ pub async fn handle_symlink(
         size: 0,
         ctime: now,
         mtime: now,
+        mode,
+        uid,
+        gid,
         layout: None, // Symlinks have no data on OSS
         parent_ino,
         pending: false, // Symlinks are immediately visible

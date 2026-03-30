@@ -112,10 +112,10 @@ fn meta_to_attr(meta: &FileMeta) -> FileAttr {
         ctime,
         crtime: ctime,
         kind,
-        perm: 0o755,
+        perm: (meta.mode & 0o777) as u16, // Extract permission bits
         nlink: meta.nlink,
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid: meta.uid,
+        gid: meta.gid,
         rdev: 0,
         blksize: BLOCK_SIZE,
         flags: 0,
@@ -982,9 +982,9 @@ impl Filesystem for RustreFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
@@ -997,6 +997,59 @@ impl Filesystem for RustreFs {
         reply: ReplyAttr,
     ) {
         let ino_val = ino.0;
+
+        // Handle permission changes (mode, uid, gid)
+        if mode.is_some() || uid.is_some() || gid.is_some() {
+            let path = match self.inodes.get_path(ino_val) {
+                Some(p) => p,
+                None => return reply.error(Errno::ENOENT),
+            };
+
+            let mds = match self.pick_mds() {
+                Ok(m) => m,
+                Err(e) => return reply.error(e),
+            };
+
+            let result = self.rt.block_on(async {
+                let rpc_reply = rpc_call(
+                    &mds,
+                    RpcKind::SetPerms {
+                        path: path.clone(),
+                        mode,
+                        uid,
+                        gid,
+                    },
+                )
+                .await
+                .map_err(rustre_err_to_errno)?;
+                match rpc_reply.kind {
+                    RpcKind::Ok => Ok(()),
+                    RpcKind::Error(e) => {
+                        error!("setperms failed: {e}");
+                        Err(Errno::EIO)
+                    }
+                    _ => Err(Errno::EIO),
+                }
+            });
+
+            if let Err(e) = result {
+                return reply.error(e);
+            }
+
+            // Update cache
+            if let Some(mut meta) = self.inodes.entries.get_mut(&ino_val) {
+                if let Some(mode_val) = mode {
+                    meta.mode = mode_val;
+                }
+                if let Some(uid_val) = uid {
+                    meta.uid = uid_val;
+                }
+                if let Some(gid_val) = gid {
+                    meta.gid = gid_val;
+                }
+                meta.mtime = FileMeta::now_secs();
+            }
+        }
 
         // Handle truncate
         if let Some(new_size) = size {
@@ -1241,8 +1294,8 @@ impl Filesystem for RustreFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let path = match self.child_path(parent.0, name) {
@@ -1255,10 +1308,23 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
+        // Apply umask to mode
+        let effective_mode = mode & !umask;
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
         let result = self.rt.block_on(async {
-            let rpc_reply = rpc_call(&mds, RpcKind::Mkdir(path.clone()))
-                .await
-                .map_err(rustre_err_to_errno)?;
+            let rpc_reply = rpc_call(
+                &mds,
+                RpcKind::MkdirWithPerms {
+                    path: path.clone(),
+                    mode: effective_mode,
+                    uid,
+                    gid,
+                },
+            )
+            .await
+            .map_err(rustre_err_to_errno)?;
             match rpc_reply.kind {
                 RpcKind::Ok => Ok(()),
                 RpcKind::Error(e) => {
@@ -1531,8 +1597,8 @@ impl Filesystem for RustreFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -1546,6 +1612,11 @@ impl Filesystem for RustreFs {
             Err(e) => return reply.error(e),
         };
 
+        // Apply umask to mode
+        let effective_mode = mode & !umask;
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
         // Create pending file on MDS
         let meta = self.rt.block_on(async {
             let rpc_reply = rpc_call(
@@ -1555,6 +1626,9 @@ impl Filesystem for RustreFs {
                     stripe_count: DEFAULT_STRIPE_COUNT,
                     stripe_size: DEFAULT_STRIPE_SIZE,
                     replica_count: 1,
+                    mode: effective_mode,
+                    uid,
+                    gid,
                 }),
             )
             .await

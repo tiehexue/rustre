@@ -41,12 +41,24 @@ pub enum RpcKind {
     Lookup(String),
     Create(CreateReq),
     Mkdir(String),
+    MkdirWithPerms {
+        path: String,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
     Readdir(String),
     Unlink(String),
     Stat(String),
     SetSize {
         path: String,
         size: u64,
+    },
+    SetPerms {
+        path: String,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
     },
     Rename {
         old_path: String,
