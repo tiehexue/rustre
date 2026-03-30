@@ -409,6 +409,8 @@ impl FdbMdsStore {
             return Ok(());
         }
 
+        let (uid, gid) = crate::utils::fid::get_ugid();
+
         let root = crate::types::FileMeta {
             ino: root_ino,
             name: "/".into(),
@@ -418,8 +420,8 @@ impl FdbMdsStore {
             ctime: crate::types::FileMeta::now_secs(),
             mtime: crate::types::FileMeta::now_secs(),
             mode: 0o755,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid,
+            gid,
             layout: None,
             parent_ino: 0,
             pending: false,

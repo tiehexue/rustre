@@ -359,8 +359,7 @@ pub async fn handle_mkdir(req_id: u64, path: &str, state: &MdsState) -> Result<R
     let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = crate::utils::fid::get_ugid();
     let mode = 0o755; // Default directory mode
     let meta = FileMeta {
         ino,
@@ -883,8 +882,7 @@ pub async fn handle_symlink(
     let ino = state.ino_alloc.alloc().await?;
 
     let now = FileMeta::now_secs();
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = crate::utils::fid::get_ugid();
     let mode = 0o777; // Symlinks have all permissions (0777)
     let meta = FileMeta {
         ino,

@@ -128,11 +128,11 @@ fn default_mode() -> u32 {
 }
 
 fn default_uid() -> u32 {
-    unsafe { libc::getuid() }
+    crate::utils::fid::get_ugid().0
 }
 
 fn default_gid() -> u32 {
-    unsafe { libc::getgid() }
+    crate::utils::fid::get_ugid().1
 }
 
 impl FileMeta {
