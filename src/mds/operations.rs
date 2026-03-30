@@ -298,9 +298,7 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
     }
 
     let layout = StripeLayout {
-        stripe_count,
         stripe_size,
-        stripe_offset,
         ost_indices,
         replica_count: req.replica_count,
         replica_map,
@@ -329,7 +327,9 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
 
     info!(
         "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={} (pending)",
-        layout.stripe_count, layout.stripe_size, layout.stripe_offset
+        layout.ost_indices.len(),
+        layout.stripe_size,
+        stripe_offset
     );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
