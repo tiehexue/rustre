@@ -269,9 +269,6 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
         ost_indices.push(available_osts[list_idx]);
     }
 
-    // The stripe_offset stored should be the first actual OST index used
-    let stripe_offset = ost_indices.first().copied().unwrap_or(0);
-
     // Create replica map if replica_count > 1
     let mut replica_map = Vec::new();
 
@@ -329,10 +326,9 @@ pub async fn handle_create(req_id: u64, req: CreateReq, state: &MdsState) -> Res
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
     debug!(
-        "MDS: created file {path} ino={ino} stripes={} stripe_size={} offset={} (pending)",
+        "MDS: created file {path} ino={ino} stripes={} stripe_size={} (pending)",
         layout.ost_indices.len(),
         layout.stripe_size,
-        stripe_offset
     );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
