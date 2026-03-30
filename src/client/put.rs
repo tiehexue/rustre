@@ -73,6 +73,9 @@ async fn put_file(
 
     // ── Phase 1: Create pending file on MDS ──
     // The file is created with pending=true, invisible to other clients.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let mode = 0o644; // Default file mode
     let reply = rpc_call(
         &mds,
         RpcKind::Create(CreateReq {
@@ -80,6 +83,9 @@ async fn put_file(
             stripe_count,
             stripe_size,
             replica_count,
+            mode,
+            uid,
+            gid,
         }),
     )
     .await?;
