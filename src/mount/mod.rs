@@ -200,6 +200,8 @@ struct OpenFile {
 // RustreFs — the FUSE filesystem implementation
 // ---------------------------------------------------------------------------
 
+type OpenDir = Arc<DashMap<u64, Vec<(INodeNo, FileType, String)>>>; // snapshot of directory entries at opendir time
+
 pub struct RustreFs {
     /// Tokio runtime for async operations
     rt: tokio::runtime::Runtime,
@@ -216,7 +218,7 @@ pub struct RustreFs {
     /// and cause offsets to skip entries — making `rm -rf` leave leftover
     /// files.  Snapshotting at opendir keeps the list stable for the whole
     /// readdir sequence.
-    open_dirs: Arc<DashMap<u64, Vec<(INodeNo, FileType, String)>>>,
+    open_dirs: OpenDir,
     /// Next file handle number
     next_fh: AtomicU64,
 }
