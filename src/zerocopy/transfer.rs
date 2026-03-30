@@ -255,7 +255,7 @@ pub async fn ost_zerocopy_task(
     meta_ino: u64,
     layout: StripeLayout,
     config: ClusterConfig,
-    ost_assignment: u32, // Which OST this task is responsible for (0..stripe_count-1)
+    ost_assignment: u32, // Which OST this task is responsible for (0..ost_indices.len()-1)
 ) -> Result<()> {
     let chunk_size = layout.stripe_size as usize;
 
@@ -310,8 +310,8 @@ pub async fn ost_zerocopy_task(
         )
         .await?;
 
-        // Advance to next chunk for this OST (skip by stripe_count)
-        chunk_index += layout.stripe_count;
+        // Advance to next chunk for this OST (skip by ost_indices.len())
+        chunk_index += layout.ost_indices.len() as u32;
     }
 
     Ok(())

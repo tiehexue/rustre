@@ -96,18 +96,17 @@ async fn put_file(
         .ok_or_else(|| RustreError::Internal("no stripe layout returned".into()))?;
 
     println!(
-        "Created {dest} (ino={}, stripes={}, stripe_size={}, offset={}, replica_count={}, pending)",
+        "Created {dest} (ino={}, stripes={}, stripe_size={}, replica_count={}, pending)",
         meta.ino,
-        layout.stripe_count,
+        layout.ost_indices.len(),
         layout.stripe_size,
-        layout.stripe_offset,
         layout.replica_count
     );
 
     // ── Phase 2: Write data to OSS ──
     // One task per stripe, all run in parallel.
     let mut write_futures = Vec::new();
-    for ost_assignment in 0..layout.stripe_count {
+    for ost_assignment in 0..layout.ost_indices.len() as u32 {
         let source_path = source.to_string();
         let config_clone = config.clone();
         let layout_clone = layout.clone();
@@ -187,7 +186,7 @@ async fn put_file(
 
     println!(
         "Successfully wrote {file_size} bytes to {dest} across {} OSTs",
-        layout.stripe_count
+        layout.ost_indices.len()
     );
     Ok(())
 }

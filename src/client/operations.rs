@@ -106,7 +106,8 @@ async fn cmd_get(mgs_addr: &str, source: &str, dest: &str) -> Result<()> {
     let chunk_size = layout.stripe_size as usize;
     println!(
         "GET: {source} → {dest} ({} bytes, {} stripes, zero-copy)",
-        file_size, layout.stripe_count
+        file_size,
+        layout.ost_indices.len()
     );
 
     // Calculate how many chunks total
@@ -315,7 +316,7 @@ async fn cmd_ls(mgs_addr: &str, path: &str) -> Result<()> {
                     let stripes = entry
                         .layout
                         .as_ref()
-                        .map(|l| format!(" [{}x{}]", l.stripe_count, l.stripe_size))
+                        .map(|l| format!(" [{}x{}]", l.ost_indices.len(), l.stripe_size))
                         .unwrap_or_default();
                     println!(
                         "{:<8} {:<6} {:>12} {}{}",
@@ -378,9 +379,8 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
             if let Some(layout) = &meta.layout {
                 let total_chunks = layout.total_chunks(meta.size);
                 println!("  Stripe Layout:");
-                println!("    stripe_count:  {}", layout.stripe_count);
+                println!("    ost_count:     {}", layout.ost_indices.len());
                 println!("    stripe_size:   {} bytes", layout.stripe_size);
-                println!("    stripe_offset: {}", layout.stripe_offset);
                 println!("    replica_count: {}", layout.replica_count);
                 println!("    total_chunks:  {}", total_chunks);
                 println!("    Object mapping (deterministic):");
