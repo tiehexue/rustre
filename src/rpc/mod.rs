@@ -142,6 +142,23 @@ pub enum RpcKind {
         path: String,
         target: String,
     },
+
+    // -- FUSE-oriented additions (appended for wire compatibility) --
+    /// Set file size by inode number (no path resolution needed).
+    /// Preferred by the FUSE client which already knows the ino.
+    /// Falls back to `SetSize { path, size }` on older MDS.
+    SetSizeByIno {
+        ino: u64,
+        size: u64,
+    },
+    /// Create a regular file (mknod fallback).
+    /// Some platforms call mknod instead of create for O_CREAT.
+    Mknod {
+        path: String,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------

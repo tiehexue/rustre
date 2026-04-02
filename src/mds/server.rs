@@ -103,6 +103,15 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<operations::MdsStat
         RpcKind::Symlink { path, target } => {
             operations::handle_symlink(msg.id, &path, &target, &state).await
         }
+        RpcKind::SetSizeByIno { ino, size } => {
+            operations::handle_set_size_by_ino(msg.id, ino, size, &state).await
+        }
+        RpcKind::Mknod {
+            path,
+            mode,
+            uid,
+            gid,
+        } => operations::handle_mknod(msg.id, &path, mode, uid, gid, &state).await,
         RpcKind::Heartbeat => {
             // Respond to heartbeat immediately
             Ok(make_reply(msg.id, RpcKind::HeartbeatReply))

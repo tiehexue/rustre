@@ -11,16 +11,21 @@ use tracing::debug;
 /// Key schema under prefix `{cluster}/mds_meta/`:
 ///
 ///   `ino/{ino:016x}`                          → FileMeta (bincode)
-///   `path/{normalized_path}`                   → u64 ino (bincode, 8 bytes LE)
-///   `children/{parent_ino:016x}/{child_ino:016x}` → empty (existence = membership)
+///   `path/{normalized_path}`                   → u64 ino (8 bytes LE)
+///   `children/{parent_ino:016x}/{name}`        → u64 child_ino (8 bytes LE)
+///
+/// The children key uses the *name* (not child_ino) as the final component
+/// so that hard-links to the same inode under different names in the same
+/// directory each have their own child entry.  This is critical for git's
+/// link(tmp_pack) → unlink(tmp_pack) workflow.
 ///
 /// Note: Inode allocation is now handled by the MGS inode range allocator.
 /// MDS instances request inode ranges in bulk from MGS and allocate locally
 /// with zero FDB contention.
 ///
 /// Design rationale:
-/// - **Children as individual keys**: avoids read-modify-write on hot directories;
-///   adding/removing a child is a single set/clear, listing is a range scan.
+/// - **Children keyed by name**: each directory entry is `children/{parent}/{name} → ino`;
+///   supports hard-links (same ino, different names), single set/clear per add/remove.
 /// - **Inode ranges from MGS**: eliminates the `next_ino` FDB hotspot.
 /// - **Transactional creates/unlinks**: inode + path + children updated atomically.
 pub struct FdbMdsStore {
@@ -52,10 +57,16 @@ impl FdbMdsStore {
         format!("{}path/{}", self.prefix, path).into_bytes()
     }
 
-    fn child_key(&self, parent_ino: u64, child_ino: u64) -> Vec<u8> {
+    /// Child key: `children/{parent_ino:016x}/{name}` → child_ino (u64 LE).
+    ///
+    /// Using the *name* (not child_ino) as the final key component means a
+    /// directory can hold multiple hard-links to the same inode under
+    /// different names, which is exactly what `git clone` does:
+    ///   link(tmp_pack → final_pack) then unlink(tmp_pack).
+    fn child_key(&self, parent_ino: u64, name: &str) -> Vec<u8> {
         format!(
-            "{}children/{:016x}/{:016x}",
-            self.prefix, parent_ino, child_ino
+            "{}children/{:016x}/{}",
+            self.prefix, parent_ino, name
         )
         .into_bytes()
     }
@@ -152,8 +163,8 @@ impl FdbMdsStore {
     // Children (directory entries)
     // -----------------------------------------------------------------------
 
-    /// List all child inode numbers of a parent directory.
-    pub async fn list_children(&self, parent_ino: u64) -> Result<Vec<u64>> {
+    /// List all children of a parent directory as (name, child_ino) pairs.
+    pub async fn list_children(&self, parent_ino: u64) -> Result<Vec<(String, u64)>> {
         let (begin, end) = self.children_prefix(parent_ino);
         let prefix_len = format!("{}children/{:016x}/", self.prefix, parent_ino).len();
 
@@ -179,12 +190,17 @@ impl FdbMdsStore {
         let mut children = Vec::new();
         for kv in result.as_ref() {
             let key_bytes = kv.key();
-            // The child ino is the last 16 hex chars of the key
-            if key_bytes.len() >= prefix_len + 16 {
-                let hex_part = &key_bytes[prefix_len..prefix_len + 16];
-                if let Ok(hex_str) = std::str::from_utf8(hex_part) {
-                    if let Ok(child_ino) = u64::from_str_radix(hex_str, 16) {
-                        children.push(child_ino);
+            // The name is everything after the prefix
+            if key_bytes.len() > prefix_len {
+                let name_part = &key_bytes[prefix_len..];
+                if let Ok(name) = std::str::from_utf8(name_part) {
+                    // Value is child_ino as u64 LE bytes
+                    let val = kv.value();
+                    if val.len() == 8 {
+                        let child_ino = u64::from_le_bytes(
+                            val.try_into().unwrap(),
+                        );
+                        children.push((name.to_string(), child_ino));
                     }
                 }
             }
@@ -211,7 +227,7 @@ impl FdbMdsStore {
     ) -> Result<()> {
         let ino_key = self.ino_key(meta.ino);
         let path_key = self.path_key(path);
-        let child_key = self.child_key(parent_ino, meta.ino);
+        let child_key = self.child_key(parent_ino, &meta.name);
 
         let meta_data =
             bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
@@ -227,7 +243,7 @@ impl FdbMdsStore {
                 async move {
                     trx.set(&ino_key, &meta_data);
                     trx.set(&path_key, &ino_data);
-                    trx.set(&child_key, &[]); // add child to parent
+                    trx.set(&child_key, &ino_data); // value = child_ino LE bytes
                     Ok(())
                 }
             })
@@ -242,12 +258,13 @@ impl FdbMdsStore {
         &self,
         ino: u64,
         path: &str,
+        name: &str,
         parent_ino: u64,
         clear_children: bool,
     ) -> Result<()> {
         let ino_key = self.ino_key(ino);
         let path_key = self.path_key(path);
-        let child_key = self.child_key(parent_ino, ino);
+        let child_key = self.child_key(parent_ino, name);
 
         // For clearing the directory's children range (should be empty, but clean up)
         let (children_begin, children_end) = if clear_children {
@@ -280,19 +297,23 @@ impl FdbMdsStore {
     }
 
     /// Atomically decrement nlink for a hard-linked file: update inode nlink,
-    /// remove one path mapping and parent-child entry, but KEEP the inode itself.
+    /// remove one path mapping and child entry, but KEEP the inode alive.
     ///
-    /// Used when unlinking a file that still has nlink > 1 after the decrement.
+    /// With the name-based child key schema (`children/{parent}/{name}`),
+    /// each hard-link name has its own child entry.  Removing the unlinked
+    /// name's child entry is safe because the remaining link(s) have their
+    /// own entries.
     pub async fn txn_dec_nlink(
         &self,
         ino: u64,
         meta: &crate::types::FileMeta,
         path: &str,
+        name: &str,
         parent_ino: u64,
     ) -> Result<()> {
         let ino_key = self.ino_key(ino);
         let path_key = self.path_key(path);
-        let child_key = self.child_key(parent_ino, ino);
+        let child_key = self.child_key(parent_ino, name);
 
         let meta_data =
             bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
@@ -308,7 +329,7 @@ impl FdbMdsStore {
                     trx.set(&ino_key, &meta_data);
                     // Remove this specific path mapping
                     trx.clear(&path_key);
-                    // Remove parent-child entry
+                    // Remove the child entry for this specific name
                     trx.clear(&child_key);
                     Ok(())
                 }
@@ -324,6 +345,8 @@ impl FdbMdsStore {
         ino: u64,
         old_path: &str,
         new_path: &str,
+        old_name: &str,
+        new_name: &str,
         old_parent_ino: u64,
         new_parent_ino: u64,
         meta: &crate::types::FileMeta,
@@ -331,8 +354,8 @@ impl FdbMdsStore {
         let ino_key = self.ino_key(ino);
         let old_path_key = self.path_key(old_path);
         let new_path_key = self.path_key(new_path);
-        let old_child_key = self.child_key(old_parent_ino, ino);
-        let new_child_key = self.child_key(new_parent_ino, ino);
+        let old_child_key = self.child_key(old_parent_ino, old_name);
+        let new_child_key = self.child_key(new_parent_ino, new_name);
 
         let meta_data =
             bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
@@ -355,7 +378,7 @@ impl FdbMdsStore {
                     trx.set(&new_path_key, &ino_data);
                     // Update parent-child relationships
                     trx.clear(&old_child_key);
-                    trx.set(&new_child_key, &[]);
+                    trx.set(&new_child_key, &ino_data);
                     Ok(())
                 }
             })
@@ -370,11 +393,12 @@ impl FdbMdsStore {
         ino: u64,
         meta: &crate::types::FileMeta,
         new_path: &str,
+        new_name: &str,
         new_parent_ino: u64,
     ) -> Result<()> {
         let ino_key = self.ino_key(ino);
         let path_key = self.path_key(new_path);
-        let child_key = self.child_key(new_parent_ino, ino);
+        let child_key = self.child_key(new_parent_ino, new_name);
 
         let meta_data =
             bincode::serialize(meta).map_err(|e| RustreError::Serialization(e.to_string()))?;
@@ -390,7 +414,7 @@ impl FdbMdsStore {
                 async move {
                     trx.set(&ino_key, &meta_data);
                     trx.set(&path_key, &ino_data);
-                    trx.set(&child_key, &[]);
+                    trx.set(&child_key, &ino_data);
                     Ok(())
                 }
             })

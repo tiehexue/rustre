@@ -500,14 +500,18 @@ pub async fn handle_readdir(req_id: u64, path: &str, state: &MdsState) -> Result
         return Err(RustreError::NotADirectory(path));
     }
 
-    // List children via FDB range scan
-    let child_inos = state.store.list_children(ino).await?;
+    // List children via FDB range scan — returns (name, child_ino) pairs
+    let child_entries = state.store.list_children(ino).await?;
 
     let mut entries = Vec::new();
-    for child_ino in child_inos {
-        if let Some(child_meta) = state.store.get_inode(child_ino).await? {
+    for (child_name, child_ino) in child_entries {
+        if let Some(mut child_meta) = state.store.get_inode(child_ino).await? {
             // Skip pending files — they're not visible until committed
             if !child_meta.pending {
+                // Use the name from the child entry (directory entry name),
+                // not the inode's canonical name, because hard-linked files
+                // can appear under different names in the same directory.
+                child_meta.name = child_name;
                 entries.push(child_meta);
             }
         }
@@ -529,6 +533,7 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
     // unlinked path may live in a different directory than the inode's
     // original parent_ino, so we must use the path's actual parent.
     let parent_path = path_utils::parent_path(&path);
+    let name = path_utils::basename(&path);
     let parent_ino = state
         .store
         .resolve_path(&parent_path)
@@ -562,7 +567,7 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
         updated.mtime = FileMeta::now_secs();
         state
             .store
-            .txn_dec_nlink(ino, &updated, &path, parent_ino)
+            .txn_dec_nlink(ino, &updated, &path, &name, parent_ino)
             .await?;
         info!(
             "MDS: unlinked {path} ino={ino} (nlink now {})",
@@ -572,7 +577,7 @@ pub async fn handle_unlink(req_id: u64, path: &str, state: &MdsState) -> Result<
         // Last link (or directory): fully remove inode + path + child entry
         state
             .store
-            .txn_unlink(ino, &path, parent_ino, meta.is_dir)
+            .txn_unlink(ino, &path, &name, parent_ino, meta.is_dir)
             .await?;
         info!("MDS: unlinked {path} ino={ino}");
     }
@@ -660,7 +665,7 @@ pub async fn handle_abort_create(req_id: u64, ino: u64, state: &MdsState) -> Res
 
     state
         .store
-        .txn_unlink(ino, &meta.path, meta.parent_ino, false)
+        .txn_unlink(ino, &meta.path, &meta.name, meta.parent_ino, false)
         .await?;
 
     debug!("MDS: aborted pending file {} ino={ino}", meta.path);
@@ -750,11 +755,13 @@ pub async fn handle_rename(
         }
 
         // Unlink the existing target
+        let existing_name = path_utils::basename(&new_path);
         state
             .store
             .txn_unlink(
                 existing_ino,
                 &new_path,
+                &existing_name,
                 existing_meta.parent_ino,
                 existing_meta.is_dir,
             )
@@ -763,8 +770,10 @@ pub async fn handle_rename(
 
     // Update metadata
     let old_parent_ino = meta.parent_ino;
+    let old_name = path_utils::basename(&old_path);
+    let new_name = path_utils::basename(&new_path);
     meta.path = new_path.clone();
-    meta.name = path_utils::basename(&new_path);
+    meta.name = new_name.clone();
     meta.parent_ino = new_parent_ino;
     meta.mtime = FileMeta::now_secs();
 
@@ -775,6 +784,8 @@ pub async fn handle_rename(
             ino,
             &old_path,
             &new_path,
+            &old_name,
+            &new_name,
             old_parent_ino,
             new_parent_ino,
             &meta,
@@ -794,7 +805,7 @@ pub async fn handle_link(
 ) -> Result<RpcMessage> {
     let new_path = path_utils::normalize_path(new_path);
     let new_parent = path_utils::parent_path(&new_path);
-    let _new_name = path_utils::basename(&new_path);
+    let new_name = path_utils::basename(&new_path);
 
     // Get existing inode
     let mut meta = state
@@ -834,10 +845,135 @@ pub async fn handle_link(
     // Atomically: update inode nlink + add new path mapping + add parent-child entry
     state
         .store
-        .txn_link(ino, &meta, &new_path, new_parent_ino)
+        .txn_link(ino, &meta, &new_path, &new_name, new_parent_ino)
         .await?;
 
     debug!("MDS: linked ino={ino} -> {new_path} (nlink={})", meta.nlink);
+    Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
+}
+
+/// Handle set-size by inode number (preferred by FUSE client).
+///
+/// Avoids redundant path resolution when the caller already knows the ino.
+pub async fn handle_set_size_by_ino(
+    req_id: u64,
+    ino: u64,
+    size: u64,
+    state: &MdsState,
+) -> Result<RpcMessage> {
+    let mut meta = state
+        .store
+        .get_inode(ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("ino {ino}")))?;
+
+    meta.size = size;
+    meta.mtime = FileMeta::now_secs();
+    state.store.set_inode(ino, &meta).await?;
+
+    Ok(make_reply(req_id, RpcKind::Ok))
+}
+
+/// Handle mknod — create a regular file (non-pending, immediately visible).
+///
+/// Used as a fallback for platforms where O_CREAT triggers mknod instead of
+/// the FUSE create callback. The file is created with size 0 and no stripe
+/// layout; a layout is assigned lazily on the first write via the FUSE client.
+pub async fn handle_mknod(
+    req_id: u64,
+    path: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    state: &MdsState,
+) -> Result<RpcMessage> {
+    let path = path_utils::normalize_path(path);
+    let parent = path_utils::parent_path(&path);
+    let name = path_utils::basename(&path);
+
+    // Check parent exists and is a directory
+    let parent_ino = state
+        .store
+        .resolve_path(&parent)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(format!("parent directory: {parent}")))?;
+
+    let parent_meta = state
+        .store
+        .get_inode(parent_ino)
+        .await?
+        .ok_or_else(|| RustreError::NotFound(parent.clone()))?;
+
+    if !parent_meta.is_dir {
+        return Err(RustreError::NotADirectory(parent));
+    }
+
+    // Check if already exists
+    if (state.store.resolve_path(&path).await?).is_some() {
+        return Err(RustreError::AlreadyExists(path));
+    }
+
+    // Fetch latest OST info to compute stripe layout
+    let latest_config = fetch_config(&state.mgs_addr).await?;
+    {
+        let mut config_write = state.cluster_config.write().await;
+        *config_write = latest_config.clone();
+    }
+
+    let config_read = state.cluster_config.read().await;
+    let available_osts: Vec<u32> = config_read
+        .ost_list
+        .iter()
+        .map(|ost| ost.ost_index)
+        .collect();
+    let ost_count = available_osts.len() as u32;
+    if ost_count == 0 {
+        return Err(RustreError::NoOstAvailable);
+    }
+
+    let ino = state.ino_alloc.alloc().await?;
+
+    // Assign a layout immediately (same logic as handle_create)
+    let stripe_count = ost_count;
+    let stripe_size = DEFAULT_STRIPE_SIZE;
+    let stripe_offset_in_list = (ino as u32) % ost_count;
+    let mut ost_indices = Vec::new();
+    for i in 0..stripe_count {
+        let list_idx = ((stripe_offset_in_list + i) % ost_count) as usize;
+        ost_indices.push(available_osts[list_idx]);
+    }
+
+    let layout = StripeLayout {
+        stripe_size,
+        ost_indices,
+        replica_count: 1,
+        replica_map: Vec::new(),
+    };
+
+    let now = FileMeta::now_secs();
+    let meta = FileMeta {
+        ino,
+        name: name.clone(),
+        path: path.clone(),
+        is_dir: false,
+        size: 0,
+        ctime: now,
+        mtime: now,
+        mode,
+        uid,
+        gid,
+        layout: Some(layout),
+        parent_ino,
+        pending: false, // Immediately visible (unlike Create which starts pending)
+        nlink: 1,
+        symlink_target: None,
+    };
+
+    state.store.txn_create(&meta, &path, parent_ino).await?;
+
+    debug!(
+        "MDS: mknod file {path} ino={ino} mode={mode:o} uid={uid} gid={gid}"
+    );
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
 
