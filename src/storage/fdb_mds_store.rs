@@ -1,6 +1,9 @@
 //! FoundationDB-backed metadata store for MDS
 
-use crate::{error::{Result, RustreError}, rpc::MAX_CHILDREN};
+use crate::{
+    error::{Result, RustreError},
+    rpc::MAX_CHILDREN,
+};
 use tracing::debug;
 
 /// FoundationDB-backed metadata store for MDS.
@@ -64,11 +67,7 @@ impl FdbMdsStore {
     /// different names, which is exactly what `git clone` does:
     ///   link(tmp_pack → final_pack) then unlink(tmp_pack).
     fn child_key(&self, parent_ino: u64, name: &str) -> Vec<u8> {
-        format!(
-            "{}children/{:016x}/{}",
-            self.prefix, parent_ino, name
-        )
-        .into_bytes()
+        format!("{}children/{:016x}/{}", self.prefix, parent_ino, name).into_bytes()
     }
 
     fn children_prefix(&self, parent_ino: u64) -> (Vec<u8>, Vec<u8>) {
@@ -174,15 +173,16 @@ impl FdbMdsStore {
                 let begin = begin.clone();
                 let end = end.clone();
                 async move {
-                    let mut range_opt = foundationdb::RangeOption::from((begin.as_slice(), end.as_slice()));
+                    let mut range_opt =
+                        foundationdb::RangeOption::from((begin.as_slice(), end.as_slice()));
                     // Set a very large limit to ensure all children are listed in one go
                     range_opt.limit = Some(MAX_CHILDREN);
                     let iteration = (MAX_CHILDREN / 39) + 1;
                     let range = trx
                         .get_range(
                             &range_opt,
-                            iteration,     // iteration - with large limit, we only need one iteration
-                            false, // snapshot
+                            iteration, // iteration - with large limit, we only need one iteration
+                            false,     // snapshot
                         )
                         .await?;
                     Ok(range)
@@ -201,9 +201,7 @@ impl FdbMdsStore {
                     // Value is child_ino as u64 LE bytes
                     let val = kv.value();
                     if val.len() == 8 {
-                        let child_ino = u64::from_le_bytes(
-                            val.try_into().unwrap(),
-                        );
+                        let child_ino = u64::from_le_bytes(val.try_into().unwrap());
                         children.push((name.to_string(), child_ino));
                     }
                 }
@@ -344,6 +342,7 @@ impl FdbMdsStore {
     }
 
     /// Atomically rename a file/directory: update inode metadata, path mapping, and parent-child links.
+    #[allow(clippy::too_many_arguments)]
     pub async fn txn_rename(
         &self,
         ino: u64,

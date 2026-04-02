@@ -1,6 +1,9 @@
 //! FoundationDB-backed metadata store for MGS
 
-use crate::{error::{Result, RustreError}, rpc::MAX_CHILDREN};
+use crate::{
+    error::{Result, RustreError},
+    rpc::MAX_CHILDREN,
+};
 
 /// FoundationDB-backed key-value store for MGS cluster state.
 ///
@@ -113,7 +116,8 @@ impl FdbMetaStore {
                 let begin = begin.clone();
                 let end = end.clone();
                 async move {
-                    let mut range_opt = foundationdb::RangeOption::from((begin.as_slice(), end.as_slice()));
+                    let mut range_opt =
+                        foundationdb::RangeOption::from((begin.as_slice(), end.as_slice()));
                     // Set a very large limit to ensure all items are listed in one go
                     range_opt.limit = Some(MAX_CHILDREN);
                     let iteration = (MAX_CHILDREN / 39) + 1;

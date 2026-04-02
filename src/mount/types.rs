@@ -99,7 +99,14 @@ impl InodeMap {
     }
 
     /// Rename: update cached path mappings atomically (best-effort).
-    pub fn rename(&self, ino: u64, old_path: &str, new_path: &str, new_name: &str, new_parent: u64) {
+    pub fn rename(
+        &self,
+        ino: u64,
+        old_path: &str,
+        new_path: &str,
+        new_name: &str,
+        new_parent: u64,
+    ) {
         self.path_to_ino.remove(old_path);
         self.path_to_ino.insert(new_path.to_string(), ino);
         if let Some(mut entry) = self.entries.get_mut(&ino) {
@@ -394,7 +401,13 @@ impl RustreFs {
             tracing::debug!("sync_size_to_mds: fallback to SetSize path={path} size={size}");
             let rpc_reply = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                rpc_call(&mds, RpcKind::SetSize { path: path.to_string(), size }),
+                rpc_call(
+                    &mds,
+                    RpcKind::SetSize {
+                        path: path.to_string(),
+                        size,
+                    },
+                ),
             )
             .await;
 

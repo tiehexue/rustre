@@ -971,9 +971,7 @@ pub async fn handle_mknod(
 
     state.store.txn_create(&meta, &path, parent_ino).await?;
 
-    debug!(
-        "MDS: mknod file {path} ino={ino} mode={mode:o} uid={uid} gid={gid}"
-    );
+    debug!("MDS: mknod file {path} ino={ino} mode={mode:o} uid={uid} gid={gid}");
     Ok(make_reply(req_id, RpcKind::MetaReply(meta)))
 }
 

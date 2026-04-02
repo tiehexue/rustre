@@ -277,15 +277,13 @@ impl RustreFs {
                 let mut wb = file.write_buf.lock();
                 std::mem::take(&mut *wb)
             };
-            (
-                file.ino,
-                file.meta.clone(),
-                buf,
-                file.writable,
-            )
+            (file.ino, file.meta.clone(), buf, file.writable)
         };
 
-        debug!("flush_writes: fh={fh} ino={ino:#x} buf_len={} writable={writable}", write_buf.len());
+        debug!(
+            "flush_writes: fh={fh} ino={ino:#x} buf_len={} writable={writable}",
+            write_buf.len()
+        );
 
         // Read-only handles: nothing to flush, never update MDS
         if !writable {

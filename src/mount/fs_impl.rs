@@ -30,9 +30,8 @@ use crate::rpc::{rpc_call, RpcKind};
 use crate::types::{CreateReq, FileMeta};
 
 use fuser::{
-    AccessFlags, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, FopenFlags,
-    Generation, INodeNo, InitFlags, IoctlFlags, LockOwner, OpenFlags, RenameFlags, TimeOrNow,
-    WriteFlags,
+    AccessFlags, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, FopenFlags, Generation,
+    INodeNo, InitFlags, IoctlFlags, LockOwner, OpenFlags, RenameFlags, TimeOrNow, WriteFlags,
 };
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -693,7 +692,7 @@ impl Filesystem for RustreFs {
         let _write_end = offset + data.len() as u64;
 
         // Check if write covers at least one FULL chunk (aligned start + chunk-length)
-        let starts_on_boundary = offset % chunk_size == 0;
+        let starts_on_boundary = offset.is_multiple_of(chunk_size);
         let mut covers_full_chunk = false;
         if starts_on_boundary && data.len() as u64 >= chunk_size {
             covers_full_chunk = true;
@@ -832,11 +831,9 @@ impl Filesystem for RustreFs {
                                         let addr = ost_info.address.clone();
                                         let ino = ino_val;
                                         futures.push(tokio::spawn(async move {
-                                            let _ = rpc_call(
-                                                &addr,
-                                                RpcKind::ObjDeleteInode { ino },
-                                            )
-                                            .await;
+                                            let _ =
+                                                rpc_call(&addr, RpcKind::ObjDeleteInode { ino })
+                                                    .await;
                                         }));
                                     }
                                     futures::future::join_all(futures).await;
@@ -1021,7 +1018,8 @@ impl Filesystem for RustreFs {
                 // Update cache
                 if let Some(ino) = self.inodes.path_to_ino.get(&old_path).map(|r| *r.value()) {
                     let new_name_str = newname.to_str().unwrap_or("").to_string();
-                    self.inodes.rename(ino, &old_path, &new_path, &new_name_str, newparent.0);
+                    self.inodes
+                        .rename(ino, &old_path, &new_path, &new_name_str, newparent.0);
                 }
                 reply.ok();
             }
