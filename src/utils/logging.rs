@@ -84,6 +84,7 @@ pub fn init_logging(command: &crate::Commands, level: &str) -> anyhow::Result<()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
         )
         .with_writer(Mutex::new(combined_writer))
+        .with_ansi(false)
         .init();
 
     Ok(())

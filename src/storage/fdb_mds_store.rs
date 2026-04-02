@@ -1,6 +1,6 @@
 //! FoundationDB-backed metadata store for MDS
 
-use crate::error::{Result, RustreError};
+use crate::{error::{Result, RustreError}, rpc::MAX_CHILDREN};
 use tracing::debug;
 
 /// FoundationDB-backed metadata store for MDS.
@@ -174,10 +174,14 @@ impl FdbMdsStore {
                 let begin = begin.clone();
                 let end = end.clone();
                 async move {
+                    let mut range_opt = foundationdb::RangeOption::from((begin.as_slice(), end.as_slice()));
+                    // Set a very large limit to ensure all children are listed in one go
+                    range_opt.limit = Some(MAX_CHILDREN);
+                    let iteration = (MAX_CHILDREN / 39) + 1;
                     let range = trx
                         .get_range(
-                            &foundationdb::RangeOption::from((begin.as_slice(), end.as_slice())),
-                            1,     // iteration
+                            &range_opt,
+                            iteration,     // iteration - with large limit, we only need one iteration
                             false, // snapshot
                         )
                         .await?;

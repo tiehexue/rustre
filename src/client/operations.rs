@@ -376,6 +376,10 @@ async fn cmd_stat(mgs_addr: &str, path: &str) -> Result<()> {
             println!("  Size:    {} bytes", meta.size);
             println!("  Created: {}", meta.ctime);
             println!("  Modified: {}", meta.mtime);
+            println!("  Pending: {}", meta.pending);
+            println!("  Nlink: {}", meta.nlink);
+            println!("  ParentNO: {}", meta.parent_ino);
+            println!("  SymlinkTarget: {}", meta.symlink_target.unwrap_or_default());
             if let Some(layout) = &meta.layout {
                 let total_chunks = layout.total_chunks(meta.size);
                 println!("  Stripe Layout:");

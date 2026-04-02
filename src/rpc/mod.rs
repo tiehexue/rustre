@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tracing::trace;
 
 pub(crate) static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
-
+pub(crate) static MAX_CHILDREN:usize = 1000_0000;
 // ---------------------------------------------------------------------------
 // RPC messages — the wire protocol between all components
 // ---------------------------------------------------------------------------

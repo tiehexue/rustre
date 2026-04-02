@@ -5,27 +5,13 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "rustre",
-            "type": "lldb",
+            "name": "mds",
+            "type": "cppdbg",
+            "MIMode": "lldb",
             "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--bin=rustre"
-                ]
-            },
-            "args": []
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/debug/rustre",
+            "args": ["mds"]
         },
-        {
-            "name": "unit tests",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--bin=rustre"
-                ]
-            }
-        }
     ]
 }
